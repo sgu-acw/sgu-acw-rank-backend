@@ -22,6 +22,7 @@ import logging
 from collections import Counter
 from datetime import date, timedelta
 
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from . import camps, daily, daytime, editorials, notifications
@@ -217,6 +218,17 @@ def _apply_diff(
     return len(new_problems)
 
 
+def _claim_sync_write(db: Session, account: Account, started_at) -> bool:
+    """抓取后才取得写锁；较旧请求不能覆盖更新的同步结果。"""
+    result = db.exec(
+        update(Account).where(Account.id == account.id).values(identifier=Account.identifier)
+    )
+    if result.rowcount != 1:
+        return False  # 抓取期间账号已解绑。
+    db.refresh(account)
+    return account.solved_fetched_at is None or account.solved_fetched_at <= started_at
+
+
 def sync_account(db: Session, account: Account, *, force: bool = False) -> tuple[bool, str, int]:
     """同步一个账号的练习记录。返回 ``(是否成功, 说明, 新增题数)``。
 
@@ -239,6 +251,8 @@ def sync_account(db: Session, account: Account, *, force: bool = False) -> tuple
     try:
         solved = fetch_solved(account.platform, account.identifier)
     except FetchError as exc:
+        if not _claim_sync_write(db, account, now):
+            return True, "同步结果已更新，忽略旧请求", 0
         # 失败也要记时间，否则下次唤醒会立刻重试，一个持续失败的账号会
         # 每五分钟撞一次墙。但重试间隔要退避：失败次数越多等得越久。
         account.solved_fetched_at = now
@@ -257,12 +271,18 @@ def sync_account(db: Session, account: Account, *, force: bool = False) -> tuple
         db.add(account)
         owner = db.get(User, account.user_id)
         owner_name = owner.display_name if owner else f"#{account.user_id}"
-        notifications.report(db, f"sync:{account.id}", "平台成绩同步失败",
+        notifications.report(
+            db,
+            f"sync:{account.id}",
+            "平台成绩同步失败",
             f"{owner_name} 的 {Platform.LABELS.get(account.platform, account.platform)} "
             f"账号 {account.identifier} 同步失败（{str(exc)[:80]}），已安排重试。",
-            "/admin")
+            "/admin",
+        )
         return False, str(exc), 0
 
+    if not _claim_sync_write(db, account, now):
+        return True, "同步结果已更新，忽略旧请求", 0
     if account.platform == Platform.LUOGU:
         # 只有洛谷没有时间戳，走差分。
         added = _apply_diff(db, account, solved)
@@ -497,8 +517,13 @@ def run_sync(*, platforms: list[str] | None = None, force: bool = False) -> dict
     except Exception:  # noqa: BLE001 - 抽题失败不能拖垮同步
         logger.exception("drawing daily problems failed")
         with session_scope() as db:
-            notifications.report(db, "daily-draw", "每日一题抽取失败",
-                                 "自动抽题失败，请检查题库和同步服务日志。", "/editorials/admin")
+            notifications.report(
+                db,
+                "daily-draw",
+                "每日一题抽取失败",
+                "自动抽题失败，请检查题库和同步服务日志。",
+                "/editorials/admin",
+            )
 
     # 公告到点撤销。和题解公布同一个小动作：过点把开关关掉，免得管理页
     # 一直显示「取消公告」。
@@ -525,8 +550,13 @@ def run_sync(*, platforms: list[str] | None = None, force: bool = False) -> dict
     except Exception:  # noqa: BLE001 - 公布失败不能拖垮同步
         logger.exception("publishing due editorials failed")
         with session_scope() as db:
-            notifications.report(db, "editorial-publish", "题解自动发布失败",
-                                 "题解发布任务失败，请检查服务日志。", "/editorials/admin")
+            notifications.report(
+                db,
+                "editorial-publish",
+                "题解自动发布失败",
+                "题解发布任务失败，请检查服务日志。",
+                "/editorials/admin",
+            )
 
     return {
         "account_count": fetched,

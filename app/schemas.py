@@ -548,7 +548,9 @@ class ProblemItemCreate(BaseModel):
     @field_validator("platform")
     @classmethod
     def _known_platform(cls, value: str) -> str:
-        if value not in Platform.ALL:
+        from .learning_helpers import learning_enabled
+
+        if value not in Platform.ALL and not (value == Platform.LEARN and learning_enabled()):
             raise ValueError("未知的平台")
         return value
 

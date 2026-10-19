@@ -22,9 +22,15 @@ from .models import (
     CampRegistration,
     DailyProgress,
     InviteUse,
+    LoginTicket,
     NotificationRead,
+    PasskeyCredential,
+    PushDispatch,
+    PushSubscription,
     RefreshQuota,
+    SignupEntry,
     SolvedSnapshot,
+    WebAuthnChallenge,
 )
 
 
@@ -58,6 +64,16 @@ def delete_user_references(db: Session, user_id: int) -> None:
     ``notification_reads`` 都带外键指向 users，不先清掉的话删用户会被
     数据库拦下。
     """
+    for model in (
+        SignupEntry,
+        PasskeyCredential,
+        WebAuthnChallenge,
+        LoginTicket,
+        PushSubscription,
+        PushDispatch,
+    ):
+        for row in db.exec(select(model).where(model.user_id == user_id)).all():
+            db.delete(row)
     for row in db.exec(select(InviteUse).where(InviteUse.user_id == user_id)).all():
         db.delete(row)
     for row in db.exec(select(RefreshQuota).where(RefreshQuota.user_id == user_id)).all():

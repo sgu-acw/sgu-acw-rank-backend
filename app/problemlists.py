@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 from .models import (
     Account,
     DailyProgress,
+    Platform,
     ProblemCache,
     ProblemList,
     ProblemListItem,
@@ -132,25 +133,47 @@ def list_problems(
             caches[(platform, key)] = row
 
     done_set = solved_keys(db, viewer_id) if viewer_id is not None else None
+    local_done: set[str] = set()
+    if viewer_id is not None and any(i.platform == Platform.LEARN for i in items):
+        from .learning_helpers import learn_done_keys
 
-    return [
-        to_entry(
-            item,
-            caches.get((item.platform, item.key)),
-            None if done_set is None else (item.platform, item.key) in done_set,
-        )
-        for item in items
-    ]
+        # 本人客户端 AC 标记只影响自己的视图，不进成员榜单。
+        local_done = learn_done_keys(db, viewer_id)
+
+    def is_done(item: ProblemListItem) -> bool | None:
+        if done_set is None:
+            return None
+        if item.platform == Platform.LEARN:
+            return item.key in local_done
+        return (item.platform, item.key) in done_set
+
+    return [to_entry(item, caches.get((item.platform, item.key)), is_done(item)) for item in items]
 
 
 def _counts_for_list(
-    db: Session, list_id: int, done_set: set[tuple[str, str]] | None
+    db: Session,
+    list_id: int,
+    done_set: set[tuple[str, str]] | None,
+    viewer_id: int | None = None,
 ) -> tuple[int, int]:
-    """题单的 (题数, 已完成数)。"""
+    """题单的 (题数, 已完成数)。本地练习用本人客户端 AC 记录。"""
     items = db.exec(select(ProblemListItem).where(ProblemListItem.list_id == list_id)).all()
     if done_set is None:
         return len(items), 0
-    done = sum(1 for item in items if (item.platform, item.key) in done_set)
+    local_done: set[str] = set()
+    if viewer_id is not None and any(i.platform == Platform.LEARN for i in items):
+        from .learning_helpers import learn_done_keys
+
+        local_done = learn_done_keys(db, viewer_id)
+    done = sum(
+        1
+        for item in items
+        if (
+            item.key in local_done
+            if item.platform == Platform.LEARN
+            else (item.platform, item.key) in done_set
+        )
+    )
     return len(items), done
 
 
@@ -169,6 +192,7 @@ def summarize(
     problem_list: ProblemList,
     *,
     done_set: set[tuple[str, str]] | None,
+    viewer_id: int | None = None,
 ) -> ProblemListPublic:
     """一个题单或合集的概要，含完成度。
 
@@ -190,11 +214,11 @@ def summarize(
         children = _children(db, problem_list.id or 0)
         info.item_count = len(children)
         for child in children:
-            total, done = _counts_for_list(db, child.id or 0, done_set)
+            total, done = _counts_for_list(db, child.id or 0, done_set, viewer_id)
             info.total_problems += total
             info.done_count += done
     else:
-        total, done = _counts_for_list(db, problem_list.id or 0, done_set)
+        total, done = _counts_for_list(db, problem_list.id or 0, done_set, viewer_id)
         info.item_count = total
         info.total_problems = total
         info.done_count = done
@@ -210,12 +234,13 @@ def detail(
 ) -> ProblemListDetail:
     """题单详情。题单带题目，合集带子题单。"""
     done_set = solved_keys(db, viewer_id) if viewer_id is not None else None
-    base = summarize(db, problem_list, done_set=done_set)
+    base = summarize(db, problem_list, done_set=done_set, viewer_id=viewer_id)
 
     out = ProblemListDetail(**base.model_dump())
     if problem_list.is_collection:
         out.children = [
-            summarize(db, child, done_set=done_set) for child in _children(db, problem_list.id or 0)
+            summarize(db, child, done_set=done_set, viewer_id=viewer_id)
+            for child in _children(db, problem_list.id or 0)
         ]
     else:
         out.problems = list_problems(db, problem_list, viewer_id=viewer_id)
@@ -252,11 +277,14 @@ def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListR
             select(ProblemListItem).where(ProblemListItem.list_id == problem_list.id)
         ).all()
 
-    total = len(items)
+    # 本地练习题的 AC 是客户端自报的，不能算进成员完成度榜单；
+    # 留在列表里展示，但不参与 wanted/total 的统计口径。
+    rankable = [i for i in items if i.platform != Platform.LEARN]
+    total = len(rankable)
     if total == 0:
         return []
 
-    wanted = {(item.platform, item.key) for item in items}
+    wanted = {(item.platform, item.key) for item in rankable}
 
     # 有绑定账号的成员。root 不算——它不是成员。
     bound_ids = select(Account.user_id).where(Account.verified_at.is_not(None))  # type: ignore[union-attr]

@@ -130,9 +130,9 @@ TICKET_TTL_SECONDS = 300
 
 
 def new_login_ticket(user_id: int) -> str:
-    """签发一张登录票据：``uid.exp.sig``，有效期 5 分钟。"""
+    """签发一张带随机 nonce 的签名票据，有效期 5 分钟。"""
     exp = int(time.time()) + TICKET_TTL_SECONDS
-    body = f"{user_id}.{exp}"
+    body = f"{user_id}.{exp}.{secrets.token_urlsafe(24)}"
     sig = hmac.new(
         get_settings().ticket_secret.encode(), body.encode(), hashlib.sha256
     ).hexdigest()
@@ -142,12 +142,12 @@ def new_login_ticket(user_id: int) -> str:
 def verify_login_ticket(ticket: str) -> int | None:
     """校验票据，返回 user_id；过期或签名不对返回 None。"""
     try:
-        uid_s, exp_s, sig = ticket.rsplit(".", 2)
+        uid_s, exp_s, nonce, sig = ticket.split(".")
         uid, exp = int(uid_s), int(exp_s)
     except (ValueError, AttributeError):
         return None
     expected = hmac.new(
-        get_settings().ticket_secret.encode(), f"{uid_s}.{exp_s}".encode(), hashlib.sha256
+        get_settings().ticket_secret.encode(), f"{uid_s}.{exp_s}.{nonce}".encode(), hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(sig, expected):
         return None

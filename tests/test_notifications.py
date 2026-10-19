@@ -334,7 +334,7 @@ def test_push_subscribe_and_announce(root_client, member_client):
     # 群体解析：audience=all 覆盖全部活跃成员；camp:N 覆盖报名人
     announce = root_client.post(
         "/api/admin/push/announce",
-        json={"title": "t", "audience": "all"},
+        json={"title": "t", "audience": "all", "request_id": "test-announce-0001"},
     )
     assert announce.status_code in (200, 503)  # 未配置 VAPID 时 503
     if announce.status_code == 200:
@@ -519,12 +519,11 @@ def test_totp_login_flow(member_client):
         assert done.json()["user"]["student_id"] == MEMBER_STUDENT_ID
         # session 能用
         assert c2.get("/api/auth/me").json()["student_id"] == MEMBER_STUDENT_ID
-        # 票据一次性+过期语义：同票据再用也不行（已消费语义——其实重放同一张票还能过，
-        # 但票据有 exp，5 分钟后自然失效；不强行作废）
+        # 一张成功消费过的票据不能再次签发会话。
         again = c2.post(
             "/api/auth/login/totp", json={"ticket": ticket, "code": pyotp.TOTP(secret).now()}
         )
-        assert again.status_code == 200  # 票据在 5 分钟内可重放，票据本来就短寿
+        assert again.status_code == 401
 
     # 关闭要先验码
     assert member_client.post("/api/auth/me/totp/disable", json={"code": "000000"}).status_code in (
@@ -558,8 +557,9 @@ def test_passkey_endpoints_exist(member_client):
     assert ropts["rp"]["id"] and ropts["user"]["name"] == MEMBER_STUDENT_ID
 
 
-def test_camp_import_problems(root_client, member_client, db):
+def test_camp_import_problems(root_client, member_client, db, monkeypatch):
     """批量导入：题号列表直给 + 题单拉取，重复跳过，错题收集。"""
+    monkeypatch.setattr("app.routers.camps._fetch_and_cache", lambda *args: None)
     from datetime import UTC, datetime, timedelta
 
     from app.models import Camp, ProblemList, ProblemListItem

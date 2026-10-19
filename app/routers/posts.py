@@ -286,19 +286,23 @@ def admin_update(
     user: User = Depends(_require_author),
 ) -> AdminPostDetail:
     """改标题/正文/排序。作者只能改自己的，管理员改谁的都行。"""
-    post = session.get(Post, post_id)
+    post = posts_mod.lock_post(session, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="没有这篇文章")
     if post.author_id != user.id and not user.is_admin:
         raise HTTPException(status_code=403, detail="只能改自己写的文章")
 
+    content_changed = (
+        payload.title is not None and payload.title != post.title
+    ) or (payload.body is not None and payload.body != post.body)
     if payload.title is not None:
         post.title = payload.title
     if payload.body is not None:
         post.body = payload.body
     if payload.sort_order is not None:
         post.sort_order = payload.sort_order
-    posts_mod.touch(post)
+    if content_changed:
+        posts_mod.touch(post)
     session.add(post)
     session.commit()
     session.refresh(post)
@@ -347,17 +351,19 @@ def admin_toggle_publish(
     user: User = Depends(_require_author),
 ) -> AdminPostSummary:
     """上下架。作者能下自己的，管理员上下都行。"""
-    post = session.get(Post, post_id)
+    post = posts_mod.lock_post(session, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="没有这篇文章")
     if post.author_id != user.id and not user.is_admin:
         raise HTTPException(status_code=403, detail="只能下架自己写的文章")
+    changed = post.published != payload.published
     post.published = payload.published
     if not payload.published:
         # 下架连着弹窗一起关
         post.is_popup = False
         post.popup_until = None
-    posts_mod.touch(post)
+    if changed:
+        posts_mod.touch(post)
     session.add(post)
     session.commit()
     session.refresh(post)

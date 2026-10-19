@@ -382,8 +382,8 @@ def test_register_after_deadline(member_client, db):
     assert "截止" in response.json()["detail"]
 
 
-def test_register_twice_is_rejected(member_client, db):
-    """重复报名返回清楚的错误。"""
+def test_register_twice_is_idempotent(member_client, db):
+    """成功报名的重试返回相同状态，不新增报名。"""
     camp = make_camp(db)
     add_problem(db, camp, key="1A")
     uid = user_id_of(db, MEMBER_STUDENT_ID)
@@ -391,7 +391,8 @@ def test_register_twice_is_rejected(member_client, db):
 
     assert member_client.post(f"/api/camps/{camp.id}/register").status_code == 201
     second = member_client.post(f"/api/camps/{camp.id}/register")
-    assert second.status_code == 400
+    assert second.status_code == 201
+    assert member_client.get(f"/api/camps/{camp.id}").json()["registration_count"] == 1
 
 
 def test_admin_adds_member_without_account(root_client, member_client, db):

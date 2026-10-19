@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import update
 from sqlmodel import Session, func, select
 
 from . import notifications
@@ -33,12 +33,23 @@ class CampError(Exception):
     """带有用户提示的集训业务错误。"""
 
 
+def lock_camp(session: Session, camp_id: int) -> Camp | None:
+    """先取得 SQLite 写锁，再读取状态，串行化名单/题目变更与封榜准备。
+
+    不在持锁期间做网络抓取；调用方在同一个事务内校验并提交。
+    """
+    session.exec(update(Camp).where(Camp.id == camp_id).values(name=Camp.name))
+    return session.get(Camp, camp_id, populate_existing=True)
+
+
 def platforms_of(session: Session, camp_id: int) -> set[str]:
+    """集训涉及的可同步平台；本地练习题不算报名前置，也不参与同步。"""
     return set(
         session.exec(
             select(CampProblem.platform)
             .where(
                 CampProblem.camp_id == camp_id,
+                CampProblem.platform != Platform.LEARN,
             )
             .distinct()
         ).all()
@@ -85,7 +96,14 @@ def can_register(session: Session, *, camp: Camp, user_id: int) -> tuple[bool, s
         return False, f"报名还没开放，{opens.astimezone(CST).strftime('%m月%d日 %H:%M')} 开始"
     needed = platforms_of(session, camp.id or 0)
     if not needed:
-        return False, "这份集训还没出题"
+        # 全是本地练习题的集训不需要绑定平台账号，只要有题就能报名。
+        has_problems = session.exec(
+            select(CampProblem.id).where(CampProblem.camp_id == camp.id).limit(1)
+        ).first()
+        if has_problems is None:
+            return False, "这份集训还没出题"
+        return True, ""
+    missing = needed - verified_platforms(session, user_id)
     missing = needed - verified_platforms(session, user_id)
     labels = "、".join(Platform.LABELS.get(p, p) for p in sorted(missing))
     if missing == needed:
@@ -122,9 +140,21 @@ def boost_accounts(session: Session, camp: Camp, user_id: int | None = None) -> 
 def register(
     session: Session, *, camp: Camp, user_id: int, admin: bool = False
 ) -> CampRegistration:
+    camp = lock_camp(session, camp.id or 0)
+    if camp is None:
+        raise CampError("集训不存在")
     user = session.get(User, user_id)
     if user is None or not user.is_active:
         raise CampError("成员不存在或已停用")
+    existing = session.exec(
+        select(CampRegistration).where(
+            CampRegistration.camp_id == camp.id, CampRegistration.user_id == user_id
+        )
+    ).first()
+    if existing is not None:
+        # 成功请求的重试只返回现有报名，不再触发账号同步。
+        session.commit()
+        return existing
     now = datetime.now(UTC)
     if now >= camp.end_at:
         raise CampError("集训已截止，报名名单已锁定")
@@ -140,29 +170,30 @@ def register(
             raise CampError(reason)
     row = CampRegistration(camp_id=camp.id or 0, user_id=user_id)
     session.add(row)
-    try:
-        session.flush()
-        boost_accounts(session, camp, user_id)
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        raise CampError("已经报过名了") from None
+    session.flush()
+    boost_accounts(session, camp, user_id)
+    session.commit()
     session.refresh(row)
     return row
 
 
 def unregister(session: Session, *, camp: Camp, user_id: int) -> None:
-    if datetime.now(UTC) >= camp.start_at:
-        raise CampError("集训已开始，请联系管理员调整报名")
+    camp = lock_camp(session, camp.id or 0)
+    if camp is None:
+        raise CampError("集训不存在")
     row = session.exec(
         select(CampRegistration).where(
             CampRegistration.camp_id == camp.id,
             CampRegistration.user_id == user_id,
         )
     ).first()
-    if row:
-        session.delete(row)
+    if row is None:
         session.commit()
+        return
+    if datetime.now(UTC) >= camp.start_at:
+        raise CampError("集训已开始，请联系管理员调整报名")
+    session.delete(row)
+    session.commit()
 
 
 def is_registered(session: Session, *, camp_id: int, user_id: int) -> bool:
@@ -181,7 +212,7 @@ def leaderboard(session: Session, camp: Camp) -> list[tuple[User, int, dict[str,
     """实时榜单，批量读账号和快照；不随人数增加查询次数。"""
     problems = session.exec(
         select(CampProblem)
-        .where(CampProblem.camp_id == camp.id)
+        .where(CampProblem.camp_id == camp.id, CampProblem.platform != Platform.LEARN)
         .order_by(CampProblem.position, CampProblem.id)
     ).all()
     if not problems:
@@ -278,6 +309,9 @@ def prepare_finalizations(session: Session) -> None:
     for camp in session.exec(
         select(Camp).where(Camp.end_at <= now, Camp.id.not_in(existing))
     ).all():
+        camp = lock_camp(session, camp.id or 0)
+        if camp is None or camp.end_at > now or session.get(CampFinalization, camp.id):
+            continue
         users = session.exec(
             select(User)
             .join(CampRegistration)
@@ -287,9 +321,10 @@ def prepare_finalizations(session: Session) -> None:
         ).all()
         problems = session.exec(
             select(CampProblem)
-            .where(CampProblem.camp_id == camp.id)
+            .where(CampProblem.camp_id == camp.id, CampProblem.platform != Platform.LEARN)
             .order_by(CampProblem.position, CampProblem.id)
         ).all()
+        # 本地练习题不进封榜成绩——它的 AC 是客户端自报的，不能当正式分数。
         accounts = session.exec(
             select(Account).where(
                 Account.user_id.in_([u.id for u in users]),
@@ -358,15 +393,19 @@ def record_final_sync(session: Session, account: Account, solved, fetched_at: da
         camp = session.get(Camp, row.camp_id)
         if camp is None or fetched_at < camp.end_at:
             continue
-        row.solved_json = json.dumps(
+        payload = json.dumps(
             [
                 normalize_key(account.platform, str(key))
                 for key, timestamp in solved.problems.items()
                 if not timestamp or timestamp <= camp.end_at.timestamp()
             ]
         )
-        row.completed_at = fetched_at
-        session.add(row)
+        # 并发同步可能已读到同一条 pending；仅第一次成功写入能占有最终结果。
+        session.exec(
+            update(CampAccountResult)
+            .where(CampAccountResult.id == row.id, CampAccountResult.completed_at.is_(None))
+            .values(solved_json=payload, completed_at=fetched_at)
+        )
 
 
 def finish_finalizations(session: Session) -> None:
@@ -413,9 +452,15 @@ def finish_finalizations(session: Session) -> None:
                 rank = i + 1
             prev = row["solved_count"]
             row["rank"] = rank
-        result.standings_json = json.dumps(rows)
-        result.finalized_at = now
-        session.add(result)
+        # 以条件写入保护最终快照，重复结算不会重新生成封榜时间。
+        session.exec(
+            update(CampFinalization)
+            .where(
+                CampFinalization.camp_id == result.camp_id,
+                CampFinalization.finalized_at.is_(None),
+            )
+            .values(standings_json=json.dumps(rows), finalized_at=now)
+        )
         notifications.resolve(session, key)
 
 
@@ -466,7 +511,8 @@ def detail_for_user(session: Session, camp: Camp, user: User | None) -> dict:
             .where(CampRegistration.camp_id == camp.id)
         ).one(),
         "problem_count": len(problems),
-        "platforms": sorted({p.platform for p in problems}),
+        # 只列需要绑定账号的平台；本地练习不需要账号，不放进提示里。
+        "platforms": sorted({p.platform for p in problems if p.platform != Platform.LEARN}),
         "can_register": ok,
         "register_reason": reason,
         "can_unregister": registered and now < camp.start_at,
@@ -474,9 +520,19 @@ def detail_for_user(session: Session, camp: Camp, user: User | None) -> dict:
         "leaderboard": [],
         **result_status(session, camp),
     }
+    mine = {}
     if registered and now >= camp.start_at:
         board = standings(session, camp)
         mine = next((r["per_problem"] for r in board if r["user_id"] == user.id), {})
+        result["leaderboard"] = board
+    # 本地练习的完成标记来自本人客户端 AC 记录（自报），仅供展示，不进榜。
+    if user is not None and any(p.platform == Platform.LEARN for p in problems):
+        from .learning_helpers import learn_done_keys
+
+        for key in learn_done_keys(session, user.id):
+            mine[f"{Platform.LEARN}:{key}"] = True
+    # 截止即公开题单，最终同步/封榜不阻塞查看；成绩仍仅供已报名成员查看。
+    if now >= camp.end_at or (registered and now >= camp.start_at):
         meta = problem_meta(session, problems)
         for p in problems:
             row = meta.get((p.platform, p.key))
@@ -490,5 +546,4 @@ def detail_for_user(session: Session, camp: Camp, user: User | None) -> dict:
                     "done": mine.get(f"{p.platform}:{p.key}", False),
                 }
             )
-        result["leaderboard"] = board
     return result

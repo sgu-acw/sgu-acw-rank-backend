@@ -6,14 +6,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, select
 
 from .. import push as push_mod
 from ..deps import get_current_user, get_session, require_admin
 from ..models import (
     CampRegistration,
+    PushDispatch,
     PushSubscription,
     Role,
     User,
@@ -34,11 +39,12 @@ class UnsubscribeIn(BaseModel):
 
 
 class AnnounceIn(BaseModel):
+    request_id: str = Field(min_length=16, max_length=64)
     title: str = Field(min_length=1, max_length=80)
     body: str = Field(default="", max_length=300)
     url: str = Field(default="/", max_length=200)
     #: all | admins | camp:<id>
-    audience: str = Field(default="all", max_length=32)
+    audience: str = Field(default="all", max_length=6000)
 
 
 @router.get("/push/vapid-key")
@@ -54,26 +60,23 @@ def subscribe(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict:
-    # 同一 endpoint 换主了（清浏览器数据后重订）：换绑到新用户。
-    row = db.exec(
-        select(PushSubscription).where(PushSubscription.endpoint == payload.endpoint)
-    ).first()
-    ua = (request.headers.get("user-agent") or "")[:300]
-    if row is None:
-        row = PushSubscription(
-            user_id=user.id or 0,
-            endpoint=payload.endpoint,
-            p256dh=payload.p256dh,
-            auth=payload.auth,
-            user_agent=ua,
+    # endpoint 是自然唯一键；并发重订阅执行原子 upsert。
+    statement = insert(PushSubscription).values(
+        user_id=user.id,
+        endpoint=payload.endpoint,
+        p256dh=payload.p256dh,
+        auth=payload.auth,
+        user_agent=(request.headers.get("user-agent") or "")[:300],
+    )
+    db.exec(
+        statement.on_conflict_do_update(
+            index_elements=["endpoint"],
+            set_={
+                key: getattr(statement.excluded, key)
+                for key in ("user_id", "p256dh", "auth", "user_agent")
+            },
         )
-        db.add(row)
-    else:
-        row.user_id = user.id or 0
-        row.p256dh = payload.p256dh
-        row.auth = payload.auth
-        row.user_agent = ua
-        db.add(row)
+    )
     db.commit()
     return {"ok": True}
 
@@ -126,9 +129,7 @@ def _audience_user_ids(db: Session, audience: str) -> list[int]:
         return [
             u.id
             for u in db.exec(
-                select(User).where(
-                    User.status == UserStatus.ACTIVE, User.enroll_year == year
-                )
+                select(User).where(User.status == UserStatus.ACTIVE, User.enroll_year == year)
             ).all()
             if u.id
         ]
@@ -156,10 +157,47 @@ def announce(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_session),
 ) -> dict:
-    user_ids = _audience_user_ids(db, payload.audience)
     if not push_mod.configured():
         raise HTTPException(status_code=503, detail="推送未配置（缺 VAPID 密钥）")
-    result = push_mod.send_to_user_ids(
-        db, user_ids, {"title": payload.title, "body": payload.body, "url": payload.url}
+    digest = hashlib.sha256(
+        json.dumps(
+            payload.model_dump(exclude={"request_id"}),
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    claim = db.exec(
+        insert(PushDispatch)
+        .values(
+            request_id=payload.request_id,
+            user_id=admin.id,
+            payload_hash=digest,
+        )
+        .on_conflict_do_nothing(index_elements=["request_id"])
     )
-    return {"audience": len(user_ids), **result}
+    row = db.get(PushDispatch, payload.request_id)
+    if claim.rowcount != 1:
+        db.commit()
+        if row.user_id != admin.id or row.payload_hash != digest:
+            raise HTTPException(status_code=409, detail="这次发送的内容已变化，请重新打开发送窗口")
+        if row.state == "completed":
+            return json.loads(row.result_json)
+        raise HTTPException(status_code=409, detail="这次推送仍在处理或结果未确认，请勿重复发送")
+    user_ids = _audience_user_ids(db, payload.audience)
+    db.commit()  # 先持久化占位；外部请求期间不持有数据库写锁。
+    try:
+        result = push_mod.send_to_user_ids(
+            db, user_ids, {"title": payload.title, "body": payload.body, "url": payload.url}
+        )
+    except Exception:
+        db.rollback()
+        row.state = "uncertain"
+        db.add(row)
+        db.commit()
+        raise
+    response = {"audience": len(user_ids), **result}
+    row.state = "completed"
+    row.result_json = json.dumps(response)
+    db.add(row)
+    db.commit()
+    return response

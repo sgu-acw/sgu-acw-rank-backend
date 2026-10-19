@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 from datetime import timedelta
 
@@ -10,13 +11,13 @@ import qrcode
 import qrcode.image.svg
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import update
+from sqlalchemy import delete, update
 from sqlmodel import Session, select
 
 from ..config import get_settings
 from ..db import get_session
 from ..deps import get_current_user, get_optional_user, require_origin_secret
-from ..models import Invite, InviteUse, User, UserSession, UserStatus, utcnow
+from ..models import Invite, InviteUse, LoginTicket, User, UserSession, UserStatus, utcnow
 from ..schemas import (
     ChangePasswordRequest,
     LoginRequest,
@@ -166,6 +167,15 @@ def register(
     return user
 
 
+def _auth_fingerprint(user: User) -> str:
+    return hashlib.sha256(f"{user.password_hash}:{user.totp_secret}".encode()).hexdigest()
+
+
+def _lock_user(db: Session, user: User) -> None:
+    db.exec(update(User).where(User.id == user.id).values(id=User.id))
+    db.refresh(user)
+
+
 @router.post("/login")
 def login(
     payload: LoginRequest,
@@ -189,10 +199,18 @@ def login(
 
     # 开了两步验证：先给一张签名的登录票据，等 TOTP 验完才发真 session。
     if user.totp_secret:
-        return {
-            "totp_required": True,
-            "ticket": new_login_ticket(user.id or 0),
-        }
+        ticket = new_login_ticket(user.id or 0)
+        db.exec(delete(LoginTicket).where(LoginTicket.expires_at < utcnow()))
+        db.add(
+            LoginTicket(
+                token_hash=hash_session_token(ticket),
+                user_id=user.id,
+                expires_at=utcnow() + timedelta(minutes=5),
+                auth_fingerprint=_auth_fingerprint(user),
+            )
+        )
+        db.commit()
+        return {"totp_required": True, "ticket": ticket}
 
     user.last_login_at = utcnow()
     db.add(user)
@@ -220,14 +238,43 @@ def login_totp(
     uid = verify_login_ticket(payload.ticket)
     if uid is None:
         raise HTTPException(status_code=401, detail="票据过期或无效，请重新登录")
-    user = db.get(User, uid)
-    if user is None or not user.totp_secret:
+    # 条件更新先占用一次尝试，串行化同票据的并发验证。
+    token_hash = hash_session_token(payload.ticket)
+    claimed = db.exec(
+        update(LoginTicket)
+        .where(
+            LoginTicket.token_hash == token_hash,
+            LoginTicket.user_id == uid,
+            LoginTicket.expires_at > utcnow(),
+            LoginTicket.attempts < 5,
+        )
+        .values(attempts=LoginTicket.attempts + 1)
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(status_code=401, detail="票据已使用、过期或尝试次数过多，请重新登录")
+    ticket = db.get(LoginTicket, token_hash)
+    user = db.get(User, uid, populate_existing=True)
+    if user is None or not user.totp_secret or ticket.auth_fingerprint != _auth_fingerprint(user):
         raise HTTPException(status_code=401, detail="票据过期或无效，请重新登录")
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="账号已停用")
-    if not pyotp.TOTP(user.totp_secret).verify(payload.code, valid_window=1):
-        raise HTTPException(status_code=401, detail="验证码不对")
-
+    totp = pyotp.TOTP(user.totp_secret)
+    step = int(utcnow().timestamp()) // totp.interval
+    matched = next(
+        (
+            n
+            for n in (step, step - 1, step + 1)
+            if pyotp.utils.strings_equal(totp.at(n * totp.interval), payload.code)
+        ),
+        None,
+    )
+    if matched is None or (
+        user.totp_last_login_step is not None and matched <= user.totp_last_login_step
+    ):
+        db.commit()  # 错误尝试也持久化，不能通过回滚绕过次数限制。
+        raise HTTPException(status_code=401, detail="验证码不对或已使用，请等待新验证码")
+    db.delete(ticket)
+    user.totp_last_login_step = matched
     user.last_login_at = utcnow()
     db.add(user)
     token = _issue_session(db, user, request)
@@ -256,8 +303,17 @@ def totp_begin(
     密钥落在 ``totp_pending_secret``，等 /me/totp/enable 验过码才转正——
     直接转正的话，二维码没扫进去的人会被锁在自己账号外。
     """
-    secret = pyotp.random_base32()
-    user.totp_pending_secret = secret
+    _lock_user(db, user)
+    if user.totp_secret:
+        raise HTTPException(status_code=409, detail="已开启两步验证，请先验证并关闭后再重新设置")
+    if (
+        not user.totp_pending_secret
+        or not user.totp_pending_expires_at
+        or user.totp_pending_expires_at <= utcnow()
+    ):
+        user.totp_pending_secret = pyotp.random_base32()
+        user.totp_pending_expires_at = utcnow() + timedelta(minutes=10)
+    secret = user.totp_pending_secret
     db.add(user)
     db.commit()
 
@@ -277,12 +333,24 @@ def totp_enable(
     db: Session = Depends(get_session),
 ) -> dict:
     """验证一个码，把 pending 密钥转正。"""
-    if not user.totp_pending_secret:
-        raise HTTPException(status_code=400, detail="没有待开启的两步验证，先调用 begin")
+    _lock_user(db, user)
+    if user.totp_secret:
+        if pyotp.TOTP(user.totp_secret).verify(payload.code, valid_window=1):
+            db.commit()
+            return {"ok": True}
+        raise HTTPException(status_code=409, detail="两步验证已开启")
+    if (
+        not user.totp_pending_secret
+        or not user.totp_pending_expires_at
+        or user.totp_pending_expires_at <= utcnow()
+    ):
+        raise HTTPException(status_code=400, detail="待开启的两步验证已过期，请重新设置")
     if not pyotp.TOTP(user.totp_pending_secret).verify(payload.code, valid_window=1):
         raise HTTPException(status_code=422, detail="验证码不对")
     user.totp_secret = user.totp_pending_secret
     user.totp_pending_secret = None
+    user.totp_pending_expires_at = None
+    user.totp_last_login_step = None
     db.add(user)
     db.commit()
     return {"ok": True}
@@ -295,12 +363,17 @@ def totp_disable(
     db: Session = Depends(get_session),
 ) -> dict:
     """关掉两步验证——要先验一次码，免得拿到会话的人随手关掉别人的。"""
+    _lock_user(db, user)
     if not user.totp_secret:
-        raise HTTPException(status_code=400, detail="没有开启两步验证")
+        db.commit()
+        return {"ok": True}
     if not pyotp.TOTP(user.totp_secret).verify(payload.code, valid_window=1):
         raise HTTPException(status_code=422, detail="验证码不对")
     user.totp_secret = None
     user.totp_pending_secret = None
+    user.totp_pending_expires_at = None
+    user.totp_last_login_step = None
+    db.exec(delete(LoginTicket).where(LoginTicket.user_id == user.id))
     db.add(user)
     db.commit()
     return {"ok": True}
@@ -323,7 +396,8 @@ def logout(
             db.delete(row)
             db.commit()
     _clear_session_cookie(response)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @router.get("/me", response_model=UserSelf)

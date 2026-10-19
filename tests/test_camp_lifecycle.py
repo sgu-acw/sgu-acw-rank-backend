@@ -9,7 +9,7 @@ import pytest
 from sqlmodel import select
 
 from app import camps, sync
-from app.models import AdminNotification, CampAccountResult, CampFinalization
+from app.models import AdminNotification, CampAccountResult, CampFinalization, ProblemCache
 from app.platforms import FetchError
 from app.platforms import SolvedSet as PlatformSolvedSet
 from tests.test_camps import (  # noqa: F401
@@ -59,6 +59,58 @@ def test_unregistration_time_and_visibility(member_client, db):
     assert detail["registered"] and not detail["can_unregister"]
     assert detail["phase"] == "running"
     assert len(detail["problems"]) == 1
+
+
+@pytest.mark.parametrize("phase", ["running", "deadline", "pending", "finalized"])
+def test_ended_problem_list_is_public_without_exposing_standings(
+    phase, client, member_client, root_client, db, monkeypatch
+):
+    camp = make_camp(db)
+    add_problem(db, camp, key="1A", position=1)
+    add_problem(db, camp, platform="luogu", key="B2064", position=0)
+    db.add(ProblemCache(platform="luogu", key="B2064", name="测试题名"))
+    account = make_account(db, 1, "codeforces", "fixture", solved=["1A"])
+    register_user(db, camp, 1)
+    cutoff = camp.end_at
+    now = cutoff - timedelta(microseconds=1) if phase == "running" else cutoff
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(camps, "datetime", Clock)
+    if phase in ("pending", "finalized"):
+        camps.prepare_finalizations(db)
+    if phase == "finalized":
+        camps.record_final_sync(
+            db, account, SolvedSet(problems={"1A": int(cutoff.timestamp()) - 60}), now
+        )
+        camps.finish_finalizations(db)
+    db.commit()
+
+    for viewer in (client, member_client):
+        response = viewer.get(f"/api/camps/{camp.id}")
+        assert response.status_code == 200
+        detail = response.json()
+        assert detail["registered"] is False
+        assert detail["leaderboard"] == []
+        if phase == "running":
+            assert detail["problems"] == []
+        else:
+            assert detail["ended"] is True
+            assert detail["phase"] == ("finalized" if phase == "finalized" else "finalizing")
+            assert [p["key"] for p in detail["problems"]] == ["B2064", "1A"]
+            assert detail["problems"][0]["name"] == "测试题名"
+            assert detail["problems"][0]["url"] == "https://www.luogu.com.cn/problem/B2064"
+            assert all(p["done"] is False for p in detail["problems"])
+            assert detail["can_register"] is False
+
+    # 已报名成员仍能查看原来的成绩和通过标记。
+    participant = root_client.get(f"/api/camps/{camp.id}").json()
+    assert participant["registered"] is True
+    assert participant["leaderboard"][0]["user_id"] == 1
+    assert participant["problems"][1]["done"] is True
 
 
 def test_admin_added_member_gets_sync_boost(root_client, member_client, db):
@@ -209,7 +261,9 @@ def test_ended_camp_mutations_locked_and_delete_cascades(root_client, member_cli
     camps.prepare_finalizations(db)
     db.commit()
     base = f"/api/admin/camps/{camp.id}"
-    assert root_client.post(f"{base}/members", json={"user_id": uid}).status_code == 400
+    # 已存在的报名可以确认成功，但截止后不能加入新人。
+    assert root_client.post(f"{base}/members", json={"user_id": uid}).status_code == 201
+    assert root_client.post(f"{base}/members", json={"user_id": 1}).status_code == 400
     assert root_client.delete(f"{base}/members/{uid}").status_code == 409
     assert (
         root_client.post(

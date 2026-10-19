@@ -94,7 +94,10 @@ def list_lists(
     from ..problemlists import solved_keys
 
     done_set = solved_keys(db, viewer.id) if viewer is not None else None
-    return [summarize(db, row, done_set=done_set) for row in rows]
+    return [
+        summarize(db, row, done_set=done_set, viewer_id=viewer.id if viewer else None)
+        for row in rows
+    ]
 
 
 @router.get("/{list_id}/rank", response_model=ProblemListRank)
@@ -285,7 +288,9 @@ def lookup_problem(
     管理员在输入框里填完题号、离开焦点时调这个，把题名显示出来。
     这样填错了当场就能看见——光看题号「1004A」看不出是哪个平台哪道题。
     """
-    if platform not in Platform.ALL:
+    from ..learning_helpers import learning_enabled
+
+    if platform not in Platform.ALL and not (platform == Platform.LEARN and learning_enabled()):
         raise HTTPException(status_code=400, detail="未知的平台")
 
     # 规范化必须在查缓存之前：用户填的是裸数字（牛客），缓存里存的是
@@ -293,6 +298,22 @@ def lookup_problem(
     key = normalize_key(platform, key)
     if not key:
         raise HTTPException(status_code=400, detail="题号不能为空")
+
+    if platform == Platform.LEARN:
+        from ..learning_helpers import learn_problem_or_400, upsert_learn_cache
+
+        problem = learn_problem_or_400(db, key)
+        cached = upsert_learn_cache(db, problem)
+        db.commit()
+        return ProblemLookup(
+            platform=platform,
+            key=key,
+            name=cached.name,
+            rating=None,
+            tags=json.loads(cached.tags_json or "[]"),
+            url=cached.url,
+            cached=True,
+        )
 
     cached = cached_problems(db, platform, [key]).get(key)
     if cached is not None:
@@ -386,7 +407,9 @@ def purge_problem_cache(
     """
     statement = delete(ProblemCache)
     if platform:
-        if platform not in Platform.ALL:
+        from ..learning_helpers import learning_enabled
+
+        if platform not in Platform.ALL and not (platform == Platform.LEARN and learning_enabled()):
             raise HTTPException(status_code=400, detail="未知的平台")
         statement = statement.where(ProblemCache.platform == platform)  # type: ignore[arg-type]
 
@@ -515,6 +538,16 @@ def add_problem(
     db.add(item)
     db.commit()
     db.refresh(item)
+
+    # 本地练习题从 learning 表取题名写进缓存，不走外部抓取。
+    if payload.platform == Platform.LEARN:
+        from ..learning_helpers import learn_problem_or_400, upsert_learn_cache
+
+        cache = upsert_learn_cache(db, learn_problem_or_400(db, key))
+        db.commit()
+        from ..problemlists import to_entry
+
+        return to_entry(item, cache, None)
 
     # 加完顺手把题目信息抓下来，列表里立刻能看到题名。
     cache = cached_problems(db, payload.platform, [key]).get(key)

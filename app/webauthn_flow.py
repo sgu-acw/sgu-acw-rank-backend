@@ -12,11 +12,15 @@ from datetime import timedelta
 
 import webauthn
 from fastapi import HTTPException
+from sqlalchemy import delete
 from sqlmodel import Session, select
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
+    AuthenticatorTransport,
+    PublicKeyCredentialDescriptor,
     ResidentKeyRequirement,
+    UserVerificationRequirement,
 )
 
 from .config import get_settings
@@ -45,12 +49,24 @@ def _store_challenge(db: Session, *, kind: str, user_id: int | None) -> str:
     return challenge
 
 
-def _load_challenge(db: Session, raw: str, kind: str) -> WebAuthnChallenge:
-    row = db.get(WebAuthnChallenge, raw)
-    if row is None or row.kind != kind or row.expires_at < utcnow():
-        raise HTTPException(status_code=422, detail="挑战已过期，请重试")
-    db.delete(row)  # 一次性：用完即毁
-    return row
+def _load_challenge(
+    db: Session,
+    raw: str,
+    kind: str,
+    *,
+    user_id: int | None = None,
+) -> None:
+    # 原子消费，避免两个请求先读到同一挑战后分别创建会话。
+    consumed = db.exec(
+        delete(WebAuthnChallenge).where(
+            WebAuthnChallenge.challenge == raw,
+            WebAuthnChallenge.kind == kind,
+            WebAuthnChallenge.user_id == user_id,
+            WebAuthnChallenge.expires_at > utcnow(),
+        )
+    )
+    if consumed.rowcount != 1:
+        raise HTTPException(status_code=422, detail="挑战已过期、已使用或不属于当前账号，请重试")
 
 
 # --------------------------------------------------------------------------- #
@@ -60,16 +76,20 @@ def _load_challenge(db: Session, raw: str, kind: str) -> WebAuthnChallenge:
 
 def begin_register(db: Session, user: User) -> dict:
     s = get_settings()
+    _purge_expired(db)
     challenge = _store_challenge(db, kind="register", user_id=user.id)
 
-    existing = db.exec(
-        select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)
-    ).all()
+    existing = db.exec(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)).all()
     exclude = [
-        {
-            "id": base64url_to_bytes(c.credential_id),
-            "transports": c.transports.split(",") if c.transports else None,
-        }
+        PublicKeyCredentialDescriptor(
+            id=base64url_to_bytes(c.credential_id),
+            transports=[
+                AuthenticatorTransport(t)
+                for t in c.transports.split(",")
+                if t in {v.value for v in AuthenticatorTransport}
+            ]
+            or None,
+        )
         for c in existing
     ]
 
@@ -84,6 +104,7 @@ def begin_register(db: Session, user: User) -> dict:
             # 登录时不先问学号——要求 authenticator 存可发现凭据，
             # 让登录端能按 RP 直接列出这个人的通行密钥。
             resident_key=ResidentKeyRequirement.REQUIRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
         ),
         exclude_credentials=exclude or None,
         timeout=int(CHALLENGE_TTL.total_seconds() * 1000),
@@ -95,7 +116,7 @@ def finish_register(
     db: Session, user: User, challenge: str, credential: dict, name: str
 ) -> PasskeyCredential:
     s = get_settings()
-    _load_challenge(db, challenge, "register")
+    _load_challenge(db, challenge, "register", user_id=user.id)
 
     try:
         verification = webauthn.verify_registration_response(
@@ -103,15 +124,13 @@ def finish_register(
             expected_challenge=base64url_to_bytes(challenge),
             expected_rp_id=s.rp_id,
             expected_origin=s.rp_origin,
-            require_user_verification=False,
+            require_user_verification=True,
         )
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"验证失败：{exc}") from exc
 
     cred_id = bytes_to_base64url(verification.credential_id)
-    if db.exec(
-        select(PasskeyCredential).where(PasskeyCredential.credential_id == cred_id)
-    ).first():
+    if db.exec(select(PasskeyCredential).where(PasskeyCredential.credential_id == cred_id)).first():
         raise HTTPException(status_code=409, detail="这个通行密钥已经绑过了")
 
     # transports 不在验证结果里（webauthn 3.x），从提交的凭据里拿。
@@ -140,14 +159,13 @@ def begin_login(db: Session) -> dict:
     options = webauthn.generate_authentication_options(
         rp_id=s.rp_id,
         challenge=base64url_to_bytes(challenge),
+        user_verification=UserVerificationRequirement.REQUIRED,
         timeout=int(CHALLENGE_TTL.total_seconds() * 1000),
     )
     return json.loads(webauthn.options_to_json(options))
 
 
-def finish_login(
-    db: Session, challenge: str, credential: dict
-) -> tuple[User, PasskeyCredential]:
+def finish_login(db: Session, challenge: str, credential: dict) -> tuple[User, PasskeyCredential]:
     s = get_settings()
     _load_challenge(db, challenge, "login")
 
@@ -170,7 +188,7 @@ def finish_login(
             expected_origin=s.rp_origin,
             credential_public_key=base64url_to_bytes(row.public_key),
             credential_current_sign_count=row.sign_count,
-            require_user_verification=False,
+            require_user_verification=True,
         )
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"验证失败：{exc}") from exc

@@ -83,7 +83,7 @@ def mark_read(db: Session, user_id: int, row: AdminNotification) -> None:
     db.exec(
         statement.on_conflict_do_update(
             index_elements=["notification_id", "user_id"],
-            set_={"revision": row.revision},
+            set_={"revision": func.max(NotificationRead.revision, row.revision)},
         )
     )
 

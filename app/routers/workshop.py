@@ -94,6 +94,15 @@ def get_schedule(session: Session = Depends(get_session)) -> list[OverrideOut]:
     return [_out(r) for r in rows]
 
 
+@router.get("/admin/workshop/schedule", response_model=list[OverrideOut])
+def admin_schedule(
+    user: User = Depends(require_admin),
+    session: Session = Depends(get_session),
+) -> list[OverrideOut]:
+    """管理页可查看所有保留的排期，包括已结束和 30 天以后的状态。"""
+    return [_out(row) for row in _live_rows(session)]
+
+
 @router.put("/admin/workshop/override", response_model=OverrideOut, status_code=201)
 def set_override(
     payload: OverrideSet,

@@ -13,6 +13,7 @@ import re
 import unicodedata
 from datetime import UTC, datetime
 
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from .models import Post, utcnow
@@ -48,6 +49,11 @@ def unique_slug(session: Session, title: str, *, exclude_id: int | None = None) 
         n += 1
 
 
+def lock_post(session: Session, post_id: int) -> Post | None:
+    session.exec(update(Post).where(Post.id == post_id).values(id=Post.id))
+    return session.get(Post, post_id, populate_existing=True)
+
+
 def set_popup(
     session: Session,
     post: Post,
@@ -56,12 +62,16 @@ def set_popup(
     until: datetime | None = None,
 ) -> None:
     """开关弹窗。开的时候把别的弹窗文章关掉——全站只弹一篇。"""
+    post = lock_post(session, post.id)
+    if post is None:
+        raise PostError("没有这篇文章")
     if on:
         others = session.exec(
             select(Post).where(Post.is_popup.is_(True), Post.id != post.id)  # type: ignore[union-attr]
         ).all()
         for other in others:
             other.is_popup = False
+            other.popup_until = None
             session.add(other)
     post.is_popup = on
     post.popup_until = until if on else None
@@ -102,16 +112,14 @@ def sweep_expired_popups(session: Session, *, now: datetime | None = None) -> in
     调，别放在读接口里偷偷写。
     """
     moment = now or datetime.now(UTC)
-    rows = session.exec(
-        select(Post).where(Post.is_popup.is_(True), Post.popup_until.is_not(None))  # type: ignore[union-attr]
-    ).all()
-    changed = 0
-    for post in rows:
-        if post.popup_until is not None and post.popup_until <= moment:
-            post.is_popup = False
-            post.popup_until = None
-            session.add(post)
-            changed += 1
-    if changed:
-        session.commit()
-    return changed
+    result = session.exec(
+        update(Post)
+        .where(
+            Post.is_popup.is_(True),
+            Post.popup_until.is_not(None),
+            Post.popup_until <= moment,
+        )
+        .values(is_popup=False, popup_until=None)
+    )
+    session.commit()
+    return result.rowcount

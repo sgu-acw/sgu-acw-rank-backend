@@ -62,6 +62,9 @@ class Platform:
     ATCODER = "atcoder"
     LUOGU = "luogu"
     NOWCODER = "nowcoder"
+    #: 浏览器内运行的本地练习题。不是同步平台：没有账号绑定、不进排行榜
+    #: 口径，只在本地评测服务启用时可以加入题单／集训。
+    LEARN = "learn"
 
     ALL = (CODEFORCES, ATCODER, LUOGU, NOWCODER)
     #: How the identifier is written down, shown in error messages.
@@ -70,6 +73,7 @@ class Platform:
         ATCODER: "AtCoder",
         LUOGU: "洛谷",
         NOWCODER: "牛客",
+        LEARN: "题库",
     }
 
 
@@ -107,6 +111,8 @@ class User(SQLModel, table=True):
     totp_secret: str | None = None
     #: 开启流程里还没验证过的半成品密钥——verify 通过才转正。
     totp_pending_secret: str | None = None
+    totp_pending_expires_at: datetime | None = None
+    totp_last_login_step: int | None = None
 
     #: 能发文章（博客/公告）的成员。管理员天然能发，不用勾。
     #: 「指定成员」场景：教练、队长要写训练总结但不该有管理员权限。
@@ -535,7 +541,10 @@ class DailyProblemSolve(SQLModel, table=True):
     __tablename__ = "daily_problem_solves"
     __table_args__ = (
         UniqueConstraint(
-            "user_id", "day", "platform", "key",
+            "user_id",
+            "day",
+            "platform",
+            "key",
             name="uq_daily_solve_user_day_problem",
         ),
     )
@@ -990,6 +999,30 @@ class PushSubscription(SQLModel, table=True):
     auth: str = Field(max_length=255)
 
     user_agent: str = Field(default="", max_length=300)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class LoginTicket(SQLModel, table=True):
+    """密码已验证后的短期票据；只存摘要，成功消费或达到尝试上限即失效。"""
+
+    __tablename__ = "login_tickets"
+    token_hash: str = Field(primary_key=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    expires_at: datetime
+    attempts: int = 0
+    auth_fingerprint: str
+
+
+class PushDispatch(SQLModel, table=True):
+    """一次管理员推送。发出前占位，响应丢失后重试返回原结果。"""
+
+    __tablename__ = "push_dispatches"
+    request_id: str = Field(primary_key=True, max_length=64)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    payload_hash: str
+    # sending / completed / uncertain；uncertain 不自动重发。
+    state: str = "sending"
+    result_json: str = "{}"
     created_at: datetime = Field(default_factory=utcnow)
 
 

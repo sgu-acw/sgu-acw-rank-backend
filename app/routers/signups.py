@@ -11,21 +11,23 @@
 - ``select``：单选，``options`` 数组给候选
 - ``checkbox``：勾选（布尔）
 
-每字段 ``{key, label, type, required, options?, hint?}``——key 是后端下发
-的 ``field_N``，前端只管渲染；改字段后旧答案按 key 对齐，删掉的字段对应
-答案留在原记录里不影响读取。
+每字段 ``{key, label, type, required, options?, hint?}``；key 是稳定标识，
+已有字段沿用原 key，新字段由客户端生成 ``field_<uuid>``，重试时保持不变。
+删掉字段的旧答案保留在原记录里，不能复用已删除的 key。
 """
 
 from __future__ import annotations
 
 import io
 import json
+import math
 import re
 from datetime import UTC, datetime
 
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import AwareDatetime, BaseModel, Field
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from .. import camps as camps_mod
@@ -41,6 +43,7 @@ EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 class FieldDef(BaseModel):
+    key: str | None = Field(default=None, max_length=64)
     label: str = Field(min_length=1, max_length=60)
     type: str = Field(default="text")
     required: bool = False
@@ -48,12 +51,24 @@ class FieldDef(BaseModel):
     hint: str = Field(default="", max_length=200)
 
 
-def _parse_fields(raw: list[FieldDef]) -> list[dict]:
-    """校验 + 规范化字段定义。key 后端分配（field_1…），防和旧答案错位。"""
+def _parse_fields(raw: list[FieldDef], previous: list[dict] | None = None) -> list[dict]:
+    """保留字段身份；编辑时新增字段使用新 key，绝不复用被删字段的编号。"""
     if len(raw) > 20:
         raise HTTPException(status_code=422, detail="最多 20 个字段")
+    known = {f["key"] for f in previous or []}
+    used: set[str] = set()
     out = []
     for i, f in enumerate(raw, 1):
+        key = f.key
+        if key in used or (
+            key is not None and key not in known and not re.fullmatch(r"field_[0-9a-f]{32}", key)
+        ):
+            raise HTTPException(status_code=422, detail="字段标识无效或重复，请刷新后重试")
+        if key is None:
+            if previous is not None:
+                raise HTTPException(status_code=422, detail="字段缺少稳定标识，请刷新页面后重试")
+            key = f"field_{i}"
+        used.add(key)
         label = f.label.strip()
         if not label:
             raise HTTPException(status_code=422, detail=f"第 {i} 个字段标题为空")
@@ -63,7 +78,7 @@ def _parse_fields(raw: list[FieldDef]) -> list[dict]:
             raise HTTPException(status_code=422, detail=f"「{label}」是选择但候选为空")
         out.append(
             {
-                "key": f"field_{i}",
+                "key": key,
                 "label": label,
                 "type": f.type,
                 "required": bool(f.required),
@@ -103,7 +118,11 @@ def _validate_answers(fields: list[dict], answers: dict) -> dict:
     for f in fields:
         raw = answers.get(f["key"])
         if f["type"] == "checkbox":
-            out[f["key"]] = bool(raw)
+            if raw is not None and not isinstance(raw, bool):
+                raise HTTPException(status_code=422, detail=f"「{f['label']}」要是勾选值")
+            if f["required"] and raw is not True:
+                raise HTTPException(status_code=422, detail=f"请勾选「{f['label']}」")
+            out[f["key"]] = raw is True
         elif f["type"] == "number":
             if raw is None or str(raw).strip() == "":
                 if f["required"]:
@@ -111,7 +130,8 @@ def _validate_answers(fields: list[dict], answers: dict) -> dict:
                 out[f["key"]] = ""
             else:
                 try:
-                    float(str(raw).strip())
+                    if not math.isfinite(float(str(raw).strip())):
+                        raise ValueError
                 except ValueError:
                     raise HTTPException(
                         status_code=422, detail=f"「{f['label']}」要是数字"
@@ -133,7 +153,7 @@ def _validate_answers(fields: list[dict], answers: dict) -> dict:
                 raise HTTPException(status_code=422, detail=f"「{f['label']}」有不在候选里的值")
             if f["required"] and not vals:
                 raise HTTPException(status_code=422, detail=f"「{f['label']}」至少选一项")
-            out[f["key"]] = vals
+            out[f["key"]] = list(dict.fromkeys(vals))
         elif f["type"] == "phone":
             v = str(raw or "").strip()
             if not v:
@@ -198,12 +218,8 @@ class EntryOut(BaseModel):
     updated_at: datetime
 
 
-def _summary(
-    s: Signup, db: Session, now: datetime, user: User | None = None
-) -> SignupSummary:
-    count = len(
-        db.exec(select(SignupEntry).where(SignupEntry.signup_id == s.id)).all()
-    )
+def _summary(s: Signup, db: Session, now: datetime, user: User | None = None) -> SignupSummary:
+    count = len(db.exec(select(SignupEntry).where(SignupEntry.signup_id == s.id)).all())
     my = False
     if user is not None:
         my = (
@@ -277,6 +293,12 @@ class SubmitEntry(BaseModel):
     answers: dict
 
 
+def _lock_signup(db: Session, signup_id: int) -> Signup | None:
+    # 报名名额检查、更新字段、撤销都在同一个 SQLite 写事务内完成。
+    db.exec(update(Signup).where(Signup.id == signup_id).values(name=Signup.name))
+    return db.get(Signup, signup_id, populate_existing=True)
+
+
 @router.post("/signups/{signup_id}/entries", status_code=200)
 def submit_entry(
     signup_id: int,
@@ -284,7 +306,7 @@ def submit_entry(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict:
-    s = db.get(Signup, signup_id)
+    s = _lock_signup(db, signup_id)
     if s is None:
         raise HTTPException(status_code=404, detail="没有这个报名")
     now = datetime.now(UTC)
@@ -302,9 +324,7 @@ def submit_entry(
         missing = needed - have
         if missing:
             labels = "、".join(Platform.LABELS.get(p, p) for p in sorted(missing))
-            raise HTTPException(
-                status_code=403, detail=f"需要先绑定并验证这些平台的账号：{labels}"
-            )
+            raise HTTPException(status_code=403, detail=f"需要先绑定并验证这些平台的账号：{labels}")
 
     # 年级限制：仅限指定级。管理端也受这个限——名单的干净比绕过更重要。
     years = _required_years(s)
@@ -323,9 +343,7 @@ def submit_entry(
     if entry is None:
         # 名额检查：只在新建时卡，改答案不占新名额。
         if s.capacity is not None:
-            count = len(
-                db.exec(select(SignupEntry).where(SignupEntry.signup_id == s.id)).all()
-            )
+            count = len(db.exec(select(SignupEntry).where(SignupEntry.signup_id == s.id)).all())
             if count >= s.capacity:
                 raise HTTPException(status_code=409, detail="名额已满")
         entry = SignupEntry(
@@ -336,9 +354,12 @@ def submit_entry(
         db.add(entry)
         message = "已报名"
     else:
-        entry.answers_json = json.dumps(answers, ensure_ascii=False)
-        entry.updated_at = utcnow()
-        db.add(entry)
+        previous = json.loads(entry.answers_json or "{}")
+        merged = {**previous, **answers}
+        if merged != previous:
+            entry.answers_json = json.dumps(merged, ensure_ascii=False)
+            entry.updated_at = utcnow()
+            db.add(entry)
         message = "已更新报名信息"
     db.commit()
     return {"ok": True, "message": message}
@@ -350,18 +371,19 @@ def withdraw_entry(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> None:
-    s = db.get(Signup, signup_id)
+    s = _lock_signup(db, signup_id)
     if s is None:
         raise HTTPException(status_code=404, detail="没有这个报名")
-    if _status(s, datetime.now(UTC)) != "open":
-        raise HTTPException(status_code=409, detail="只能在报名开放期间撤销")
     entry = db.exec(
         select(SignupEntry).where(
             SignupEntry.signup_id == signup_id, SignupEntry.user_id == user.id
         )
     ).first()
     if entry is None:
+        db.commit()
         return
+    if _status(s, datetime.now(UTC)) != "open":
+        raise HTTPException(status_code=409, detail="只能在报名开放期间撤销")
     db.delete(entry)
     db.commit()
 
@@ -442,7 +464,7 @@ def admin_update(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_session),
 ) -> SignupSummary:
-    s = db.get(Signup, signup_id)
+    s = _lock_signup(db, signup_id)
     if s is None:
         raise HTTPException(status_code=404, detail="没有这个报名")
     fields = payload.model_fields_set
@@ -454,7 +476,16 @@ def admin_update(
     if "description" in fields:
         s.description = (payload.description or "").strip()
     if "fields" in fields and payload.fields is not None:
-        s.fields_json = json.dumps(_parse_fields(payload.fields), ensure_ascii=False)
+        previous = _fields(s)
+        current_keys = {f["key"] for f in previous}
+        new_keys = {f.key for f in payload.fields} - current_keys
+        if new_keys:
+            for entry in db.exec(
+                select(SignupEntry).where(SignupEntry.signup_id == signup_id)
+            ).all():
+                if new_keys & set(json.loads(entry.answers_json)):
+                    raise HTTPException(status_code=422, detail="不能复用已删除字段的标识")
+        s.fields_json = json.dumps(_parse_fields(payload.fields, previous), ensure_ascii=False)
     if "required_platforms" in fields and payload.required_platforms is not None:
         platforms = [p for p in payload.required_platforms if p in Platform.ALL]
         s.required_platforms_json = json.dumps(platforms, ensure_ascii=False)

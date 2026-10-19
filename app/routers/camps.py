@@ -6,16 +6,16 @@
 
 from __future__ import annotations
 
-import time
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from pydantic import AwareDatetime, BaseModel, Field, StringConstraints
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, func, select
 
 from .. import camps as camps_mod
+from ..db import get_engine
 from ..deps import get_current_user, get_optional_user, get_session, require_admin
 from ..models import (
     Camp,
@@ -24,6 +24,7 @@ from ..models import (
     CampProblem,
     CampRegistration,
     Platform,
+    ProblemCache,
     ProblemList,
     ProblemListItem,
     Role,
@@ -46,7 +47,7 @@ class CampProblemOut(BaseModel):
     name: str = ""
     rating: int | None = None
     url: str = ""
-    #: 当前查看的人过了没有。未报名拿不到这个字段——题面本身都不给看。
+    #: 已报名成员的集训通过状态；截止后公开题单中，未报名访问者返回 False。
     done: bool = False
 
 
@@ -364,7 +365,9 @@ def require_pre_start(camp: Camp) -> None:
     """开始前才能改的字段：开放报名和开始显示是「开始前」的概念，
     集训跑起来之后再调它们没有意义——反而能把进行中的集训藏没。"""
     if datetime.now(UTC) >= camp.start_at:
-        raise HTTPException(status_code=409, detail="集训已开始，开放报名和显示时间已锁定")
+        raise HTTPException(
+            status_code=409, detail="集训已开始，开始时间、开放报名和显示时间已锁定"
+        )
 
 
 @router.put("/admin/camps/{camp_id}", response_model=CampSummary)
@@ -374,7 +377,7 @@ def admin_update(
     session: Session = Depends(get_session),
     _admin: User = Depends(require_admin),
 ) -> CampSummary:
-    camp = session.get(Camp, camp_id)
+    camp = camps_mod.lock_camp(session, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     time_fields = {
@@ -385,10 +388,19 @@ def admin_update(
         "visible_at",
         "visible_days",
     }
-    if payload.model_fields_set & time_fields:
+    for prefix in ("register_open", "visible"):
+        if (
+            getattr(payload, f"{prefix}_at") is not None
+            and getattr(payload, f"{prefix}_days") is not None
+        ):
+            raise HTTPException(status_code=422, detail="绝对时间和相对天数只能选一种模式")
+    changed = {
+        key for key in payload.model_fields_set if getattr(payload, key) != getattr(camp, key)
+    }
+    if changed & time_fields:
         require_editable(camp)
     pre_start_fields = {"register_open_at", "register_open_days", "visible_at", "visible_days"}
-    if payload.model_fields_set & pre_start_fields:
+    if changed & (pre_start_fields | {"start_at"}):
         require_pre_start(camp)
     if payload.name is not None:
         camp.name = payload.name
@@ -400,7 +412,7 @@ def admin_update(
         camp.end_at = payload.end_at
     if camp.end_at <= camp.start_at:
         raise HTTPException(status_code=400, detail="截止时间得晚于开始时间")
-    times_changed = "start_at" in payload.model_fields_set or "end_at" in payload.model_fields_set
+    times_changed = bool(changed & {"start_at", "end_at"})
     # 模式互斥：传哪个用哪个，顺带清掉另一种。
     if "register_open_days" in payload.model_fields_set:
         camp.register_open_days = payload.register_open_days
@@ -522,15 +534,24 @@ def admin_add_problem(
     session: Session = Depends(get_session),
     _admin: User = Depends(require_admin),
 ) -> dict:
-    camp = session.get(Camp, camp_id)
+    camp = camps_mod.lock_camp(session, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     require_editable(camp)
-    if payload.platform not in Platform.ALL:
+    from ..learning_helpers import learning_enabled
+
+    if payload.platform not in Platform.ALL and not (
+        payload.platform == Platform.LEARN and learning_enabled()
+    ):
         raise HTTPException(status_code=400, detail="未知的平台")
     key = normalize_key(payload.platform, payload.key)
     if not key or len(key) > 128:
         raise HTTPException(status_code=400, detail="请输入有效题号（最多 128 字符）")
+    # 本地练习先确认题目已发布，失败在写入之前拒绝。
+    if payload.platform == Platform.LEARN:
+        from ..learning_helpers import learn_problem_or_400
+
+        learn_problem_or_400(session, key)
     last = session.exec(
         select(CampProblem)
         .where(CampProblem.camp_id == camp_id)
@@ -554,8 +575,14 @@ def admin_add_problem(
         session.rollback()
         raise HTTPException(status_code=409, detail="这道题已经在集训中") from None
     # 顺手把题名抓下来——不抓的话 problem_cache 里没这条，列表和
-    # 排行榜题号悬停都显示不了名字。
-    _fetch_and_cache(session, payload.platform, key)
+    # 排行榜题号悬停都显示不了名字。本地练习直接从 learning 表取。
+    if payload.platform == Platform.LEARN:
+        from ..learning_helpers import learn_problem_or_400, upsert_learn_cache
+
+        upsert_learn_cache(session, learn_problem_or_400(session, key))
+        session.commit()
+    else:
+        _fetch_and_cache(session, payload.platform, key)
     return {"ok": True, "id": row.id}
 
 
@@ -570,18 +597,41 @@ class ProblemImport(BaseModel):
     重复的就跳过，别一条报错把整个导入打死。
     """
 
-    items: list[ProblemAdd] = Field(default_factory=list)
+    items: list[ProblemAdd] = Field(default_factory=list, max_length=2000)
     problem_list_id: int | None = None
+
+
+def _cache_imported_problems(keys: list[tuple[str, str]]) -> None:
+    """元信息抓取与导入事务分开，响应不等待上游逐题请求。"""
+    with Session(get_engine()) as db:
+        for platform, key in keys:
+            if platform == Platform.LEARN:
+                from ..learning_helpers import learn_problem_or_400, upsert_learn_cache
+
+                try:
+                    upsert_learn_cache(db, learn_problem_or_400(db, key))
+                except HTTPException:
+                    continue
+                continue
+            cached = db.exec(
+                select(ProblemCache).where(
+                    ProblemCache.platform == platform,
+                    ProblemCache.key == key,
+                )
+            ).first()
+            if cached is None:
+                _fetch_and_cache(db, platform, key)
 
 
 @router.post("/admin/camps/{camp_id}/problems/import")
 def admin_import_problems(
     camp_id: int,
     payload: ProblemImport,
+    background_tasks: BackgroundTasks,
     session: Session = Depends(get_session),
     _admin: User = Depends(require_admin),
 ) -> dict:
-    camp = session.get(Camp, camp_id)
+    camp = camps_mod.lock_camp(session, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     require_editable(camp)
@@ -596,7 +646,9 @@ def admin_import_problems(
         if pl.is_collection:
             lists = list(
                 session.exec(
-                    select(ProblemList).where(ProblemList.collection_id == pl.id)
+                    select(ProblemList)
+                    .where(ProblemList.collection_id == pl.id)
+                    .order_by(ProblemList.position, ProblemList.id)
                 ).all()
             )
             if not lists:
@@ -605,7 +657,7 @@ def admin_import_problems(
             for item in session.exec(
                 select(ProblemListItem)
                 .where(ProblemListItem.list_id == lst.id)
-                .order_by(ProblemListItem.position)  # type: ignore[attr-defined]
+                .order_by(ProblemListItem.position, ProblemListItem.id)
             ).all():
                 source.append((item.platform, item.key))
     for it in payload.items:
@@ -628,8 +680,10 @@ def admin_import_problems(
     added_keys: list[tuple[str, str]] = []
     skipped = 0
     failed: list[str] = []
+    from ..learning_helpers import learning_enabled
+
     for platform, raw_key in source:
-        if platform not in Platform.ALL:
+        if platform not in Platform.ALL and not (platform == Platform.LEARN and learning_enabled()):
             failed.append(f"{platform}:{raw_key}")
             continue
         key = normalize_key(platform, raw_key)
@@ -639,9 +693,15 @@ def admin_import_problems(
         if (platform, key) in existing:
             skipped += 1
             continue
-        session.add(
-            CampProblem(camp_id=camp_id, platform=platform, key=key, position=pos)
-        )
+        if platform == Platform.LEARN:
+            from ..learning_helpers import learn_problem_or_400
+
+            try:
+                learn_problem_or_400(session, key)
+            except HTTPException:
+                failed.append(f"{platform}:{raw_key}")
+                continue
+        session.add(CampProblem(camp_id=camp_id, platform=platform, key=key, position=pos))
         pos += 1
         added_keys.append((platform, key))
         existing.add((platform, key))
@@ -651,13 +711,9 @@ def admin_import_problems(
         camps_mod.boost_accounts(session, camp)
         session.commit()
 
-        # 抓题名，但给整个导入限 25s——题多的时候不能卡在抓题上超时。
-        # 漏掉的由后面的按需抓取补齐。
-        deadline = time.time() + 25
-        for platform, key in added_keys:
-            if time.time() > deadline:
-                break
-            _fetch_and_cache(session, platform, key)
+        background_tasks.add_task(_cache_imported_problems, added_keys)
+    else:
+        session.commit()  # 全部重复也释放写锁；不重置账号同步时间。
 
     return {
         "added": len(added_keys),
@@ -678,7 +734,7 @@ def admin_reorder_problems(
     _admin: User = Depends(require_admin),
 ) -> list[AdminCampProblem]:
     """拖拽排序集训里的题目。跟题单的 reorder 是一个模式：整个顺序提交。"""
-    camp = session.get(Camp, camp_id)
+    camp = camps_mod.lock_camp(session, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     require_editable(camp)
@@ -720,7 +776,7 @@ def admin_delete_problem(
     session: Session = Depends(get_session),
     _admin: User = Depends(require_admin),
 ) -> Response:
-    camp = session.get(Camp, camp_id)
+    camp = camps_mod.lock_camp(session, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     require_editable(camp)
@@ -757,7 +813,7 @@ def admin_remove_member(
     session: Session = Depends(get_session),
     _admin: User = Depends(require_admin),
 ) -> Response:
-    camp = session.get(Camp, camp_id)
+    camp = camps_mod.lock_camp(session, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     require_editable(camp)

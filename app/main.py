@@ -30,6 +30,7 @@ from .routers import (
     camps,
     daily,
     editorials,
+    learning,
     meta,
     notifications,
     posts,
@@ -160,6 +161,8 @@ def create_app() -> FastAPI:
     app.include_router(push.router, prefix=API_PREFIX)
     app.include_router(signups.router, prefix=API_PREFIX)
     app.include_router(webauthn.router, prefix=API_PREFIX)
+    # 题库：题目/版本/提交记录。表由 init_db 的 create_all 建立。
+    app.include_router(learning.router, prefix=API_PREFIX)
 
     def record_request_health(method: str, path: str, failed: bool) -> None:
         try:
@@ -211,6 +214,12 @@ def create_app() -> FastAPI:
             field = str(item.get("loc", ("",))[-1]) if item.get("loc") else ""
             if field in SENSITIVE_FIELDS and "input" in item:
                 item["input"] = "***"
+            # pydantic 的 ctx.error 是裸异常对象，直接进 JSONResponse 会 500。
+            if isinstance(item.get("ctx"), dict):
+                item["ctx"] = {
+                    key: str(value) if isinstance(value, BaseException) else value
+                    for key, value in item["ctx"].items()
+                }
             details.append(item)
         return JSONResponse(status_code=422, content={"detail": details})
 

@@ -131,6 +131,10 @@ def normalize_key(platform: str, key: str) -> str:
     if platform == Platform.ATCODER:
         return value.lower()
 
+    # 本地练习题的 key 就是题目 id；去掉前导零保持唯一约束语义一致。
+    if platform == Platform.LEARN:
+        return str(int(value)) if value.isdigit() else ""
+
     return value
 
 
@@ -197,6 +201,9 @@ def problem_url(platform: str, key: str) -> str:
         if contest and suffix:
             return f"https://atcoder.jp/contests/{contest}/tasks/{key}"
         return "https://atcoder.jp/contests/"
+
+    if platform == Platform.LEARN:
+        return f"/learn/problem?id={key}"
 
     if platform == Platform.NOWCODER:
         source, problem_id = parse_nowcoder_key(key)
