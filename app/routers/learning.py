@@ -48,8 +48,13 @@ class ProblemContent(BaseModel):
     #: 输入/输出格式说明，可选，留空则不显示对应小节。
     input_format: str = Field(default="", max_length=20_000)
     output_format: str = Field(default="", max_length=20_000)
+    #: 说明/提示（样例解释、注意事项），可选。
+    note: str = Field(default="", max_length=20_000)
     environments: list[Environment] = Field(min_length=1, max_length=5)
-    checker: Literal["exact", "tokens"] = "tokens"
+    checker: Literal["exact", "tokens", "spj"] = "tokens"
+    #: checker=spj 时的 Python 判定程序：读 /input /expected /actual 三个文件，
+    # 退出码 0 判通过，非 0 判答案错误，stderr 作为说明回显。
+    checker_source: str = Field(default="", max_length=100_000)
     time_ms: int = Field(default=3000, ge=100, le=30_000)
     tests: list[TestCase] = Field(min_length=1, max_length=100)
 
@@ -66,6 +71,8 @@ class ProblemContent(BaseModel):
             raise ValueError("语言不能重复")
         if not any(t.sample for t in self.tests):
             raise ValueError("至少需要一个样例")
+        if self.checker == "spj" and not self.checker_source.strip():
+            raise ValueError("使用 Special Judge 必须提供判定程序")
         if sum(len((t.input + t.output).encode()) for t in self.tests) > 8_000_000:
             raise ValueError("测试数据合计不能超过 8 MB")
         return self
