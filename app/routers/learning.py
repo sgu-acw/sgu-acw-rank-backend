@@ -45,6 +45,9 @@ class ProblemContent(BaseModel):
     difficulty: Difficulty = "入门"
     tags: list[str] = Field(default_factory=list, max_length=8)
     statement: str = Field(min_length=1, max_length=40_000)
+    #: 输入/输出格式说明，可选，留空则不显示对应小节。
+    input_format: str = Field(default="", max_length=20_000)
+    output_format: str = Field(default="", max_length=20_000)
     environments: list[Environment] = Field(min_length=1, max_length=5)
     checker: Literal["exact", "tokens"] = "tokens"
     time_ms: int = Field(default=3000, ge=100, le=30_000)
