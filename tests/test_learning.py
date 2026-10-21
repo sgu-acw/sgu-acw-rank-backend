@@ -221,7 +221,10 @@ def test_learn_problems_join_lists_and_camps(local_client):
     row = detail["problems"][0]
     assert row["platform"] == "learn" and row["done"] is False
     assert row["url"].endswith(f"id={problem_id}")
-    assert detail["leaderboard"] == []  # learn 不计分
+    # learn 题进榜（邀请制自报口径），报名后没 AC 前是 0 分。
+    assert len(detail["leaderboard"]) == 1
+    assert detail["leaderboard"][0]["solved_count"] == 0
+    assert detail["leaderboard"][0]["per_problem"][f"learn:{problem_id}"] is False
 
     # 同步一条自报 AC 后，题单和集训里的完成标记变成 True。
     version = local_client.get(f"/api/learning/problems/{problem_id}").json()["version_id"]
@@ -241,6 +244,8 @@ def test_learn_problems_join_lists_and_camps(local_client):
     )
     detail = local_client.get(f"/api/camps/{camp_id}").json()
     assert detail["problems"][0]["done"] is True
+    assert detail["leaderboard"][0]["solved_count"] == 1
+    assert detail["leaderboard"][0]["per_problem"][f"learn:{problem_id}"] is True
     listed = local_client.get(f"/api/problem-lists/{list_id}").json()
     assert listed["problems"][0]["done"] is True
     assert listed["done_count"] == 1
