@@ -10,6 +10,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, func, select
 
 from . import notifications
@@ -212,7 +213,7 @@ def leaderboard(session: Session, camp: Camp) -> list[tuple[User, int, dict[str,
     """实时榜单，批量读账号和快照；不随人数增加查询次数。"""
     problems = session.exec(
         select(CampProblem)
-        .where(CampProblem.camp_id == camp.id, CampProblem.platform != Platform.LEARN)
+        .where(CampProblem.camp_id == camp.id)
         .order_by(CampProblem.position, CampProblem.id)
     ).all()
     if not problems:
@@ -234,10 +235,32 @@ def leaderboard(session: Session, camp: Camp) -> list[tuple[User, int, dict[str,
         solved.setdefault(uid, set()).update(
             (platform, normalize_key(platform, str(k))) for k in json.loads(payload)
         )
+    # 题库题的完成记录来自 LearningRun 自报 AC——邀请制集训信任这个口径，
+    # 前端会在榜单上标「自报」。正式库可能没装 learning 表，查询失败按空处理。
+    learn_done: dict[int, set[str]] = {}
+    if any(p.platform == Platform.LEARN for p in problems):
+        try:
+            from .learning_models import LearningRun, LearningVersion
+
+            learn_rows = session.exec(
+                select(LearningRun.user_id, LearningVersion.problem_id)
+                .join(LearningVersion, LearningRun.version_id == LearningVersion.id)
+                .where(LearningRun.user_id.in_([u.id for u in users]), LearningRun.verdict == "AC")
+            ).all()
+            for uid, pid in learn_rows:
+                learn_done.setdefault(uid, set()).add(str(pid))
+        except OperationalError:
+            pass
     rows = []
     for user in users:
+        done = solved.get(user.id, set())
+        learn = learn_done.get(user.id, set())
         per_problem = {
-            f"{p.platform}:{p.key}": (p.platform, p.key) in solved.get(user.id, set())
+            f"{p.platform}:{p.key}": (
+                str(p.key) in learn
+                if p.platform == Platform.LEARN
+                else (p.platform, p.key) in done
+            )
             for p in problems
         }
         rows.append((user, sum(per_problem.values()), per_problem))
