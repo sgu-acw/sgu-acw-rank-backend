@@ -10,7 +10,15 @@ from sqlmodel import Session, select
 from app import camps
 from app.db import get_engine
 from app.learning_models import LearningRun, LearningVersion
-from app.models import Camp, CampFinalization, CampProblem, CampRegistration, ProblemCache, User
+from app.models import (
+    AdminNotification,
+    Camp,
+    CampFinalization,
+    CampProblem,
+    CampRegistration,
+    ProblemCache,
+    User,
+)
 from tests.test_learning import local_client, login  # noqa: F401
 
 
@@ -278,3 +286,10 @@ def test_mixed_camp_finalizes_learning_and_external_results_together(local_clien
     assert detail["phase"] == "finalized"
     assert detail["leaderboard"][0]["solved_count"] == 2
     assert detail["leaderboard"][0]["per_problem"] == {"learn:1": True, "codeforces:1A": True}
+    with Session(get_engine()) as db:
+        warning = db.exec(
+            select(AdminNotification).where(
+                AdminNotification.fingerprint == f"camp-finalization:{camp_id}"
+            )
+        ).one()
+        assert warning.resolved_at is not None

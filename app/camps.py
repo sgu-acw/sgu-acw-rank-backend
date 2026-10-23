@@ -468,9 +468,9 @@ def finish_finalizations(session: Session) -> None:
             .where(CampProblem.camp_id == result.camp_id, CampProblem.platform == Platform.LEARN)
             .order_by(CampProblem.position, CampProblem.id)
         ).all():
-            key = f"{Platform.LEARN}:{problem.key}"
-            if key not in keys:
-                keys.append(key)
+            problem_key = f"{Platform.LEARN}:{problem.key}"
+            if problem_key not in keys:
+                keys.append(problem_key)
         if any(key.startswith(f"{Platform.LEARN}:") for key in keys):
             camp = session.get(Camp, result.camp_id)
             if camp is None:

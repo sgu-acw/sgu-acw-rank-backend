@@ -256,6 +256,8 @@ def publish(
 
 
 class RunBody(BaseModel):
+    #: 新客户端重试时校验原账号；旧客户端可省略，幂等摘要保持兼容。
+    expected_user_id: int | None = Field(default=None, gt=0)
     id: UUID
     version_id: UUID
     environment: Environment
@@ -268,12 +270,16 @@ class RunBody(BaseModel):
 def save_run(
     body: RunBody, db: Session = Depends(get_session), user: User = Depends(get_current_user)
 ):
+    if body.expected_user_id is not None and body.expected_user_id != user.id:
+        raise HTTPException(403, "登录账号已变化，请重新登录原账号后同步")
     v = db.get(LearningVersion, str(body.version_id))
     if v is None or problem_or_404(db, v.problem_id).published_revision is None:
         raise HTTPException(404, "题目版本不存在")
     if body.environment not in json.loads(v.content_json)["environments"]:
         raise HTTPException(422, "该题不支持所选环境")
-    digest = sha256(encoded(body.model_dump(mode="json")).encode()).hexdigest()
+    digest = sha256(
+        encoded(body.model_dump(mode="json", exclude={"expected_user_id"})).encode()
+    ).hexdigest()
     db.exec(
         insert(LearningRun)
         .values(
