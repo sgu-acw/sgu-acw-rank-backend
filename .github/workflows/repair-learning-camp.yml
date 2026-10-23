@@ -1,0 +1,57 @@
+name: Review or repair learning camp snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      camp_id:
+        description: Camp ID
+        required: true
+        type: string
+      apply:
+        description: Apply the reviewed repair (false only previews)
+        required: true
+        default: false
+        type: boolean
+      expected_hash:
+        description: snapshot_hash from the approved preview; required for apply
+        required: false
+        type: string
+
+concurrency:
+  group: learning-camp-repair-${{ inputs.camp_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SGU_ACW_SSH_KEY }}
+          SSH_HOST: ${{ secrets.SGU_ACW_SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+      - name: Preview or apply
+        env:
+          SSH_USER: ${{ secrets.SGU_ACW_SSH_USER }}
+          SSH_HOST: ${{ secrets.SGU_ACW_SSH_HOST }}
+          CAMP_ID: ${{ inputs.camp_id }}
+          APPLY: ${{ inputs.apply }}
+          EXPECTED_HASH: ${{ inputs.expected_hash }}
+        run: |
+          set -euo pipefail
+          [[ "$CAMP_ID" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid camp ID\n'; exit 1; }
+          command_args="--camp-id $CAMP_ID"
+          if [[ "$APPLY" == "true" ]]; then
+            [[ "$EXPECTED_HASH" =~ ^[0-9a-f]{64}$ ]] || { printf 'Expected snapshot hash is required\n'; exit 1; }
+            backup_path="/var/lib/sgu-acw/backups/camp-$CAMP_ID-$(date -u +%Y%m%dT%H%M%SZ).json"
+            command_args="$command_args --apply --expected-hash $EXPECTED_HASH --backup $backup_path"
+          fi
+          ssh -o BatchMode=yes "$SSH_USER@$SSH_HOST" \
+            "cd /opt/sgu-acw-api && .venv/bin/python -m app.learning_camp_repair --database-url sqlite:////var/lib/sgu-acw/api.db $command_args"

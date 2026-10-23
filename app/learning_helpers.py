@@ -6,6 +6,7 @@
 
 import json
 import os
+from datetime import datetime
 
 from fastapi import HTTPException
 from sqlalchemy.exc import OperationalError
@@ -63,21 +64,32 @@ def upsert_learn_cache(db: Session, problem) -> ProblemCache:
     return row
 
 
-def learn_done_keys(db: Session, user_id: int | None) -> set[str]:
-    """用户在本地练习中 AC 过的题目 id 集合（自报成绩，仅做展示）。
-
-    正式库没有 learning 表；即使存在脏数据也返回空集合而不是抛错。
-    """
-    if user_id is None or not learning_enabled():
-        return set()
+def learn_done_by_user(
+    db: Session, user_ids: list[int], *, through: datetime | None = None
+) -> dict[int, set[str]]:
+    """批量读取已通过题号；集训传截止时间，历史通过仍计分。"""
+    if not user_ids or not learning_enabled():
+        return {}
     from .learning_models import LearningRun, LearningVersion
 
+    query = (
+        select(LearningRun.user_id, LearningVersion.problem_id)
+        .join(LearningVersion, LearningRun.version_id == LearningVersion.id)
+        .where(LearningRun.user_id.in_(user_ids), LearningRun.verdict == "AC")
+        .distinct()
+    )
+    if through is not None:
+        query = query.where(LearningRun.created_at <= through)
     try:
-        rows = db.exec(
-            select(LearningVersion.problem_id)
-            .join(LearningRun, LearningRun.version_id == LearningVersion.id)
-            .where(LearningRun.user_id == user_id, LearningRun.verdict == "AC")
-        ).all()
+        rows = db.exec(query).all()
     except OperationalError:
-        return set()
-    return {str(pid) for pid in rows}
+        return {}
+    done: dict[int, set[str]] = {}
+    for user_id, problem_id in rows:
+        done.setdefault(user_id, set()).add(str(problem_id))
+    return done
+
+
+def learn_done_keys(db: Session, user_id: int | None) -> set[str]:
+    """用户全部已通过题号，供题库和普通题单显示学习进度。"""
+    return learn_done_by_user(db, [user_id]).get(user_id, set()) if user_id is not None else set()

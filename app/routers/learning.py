@@ -68,7 +68,6 @@ class ProblemContent(BaseModel):
             not t.strip() or len(t) > 30 for t in self.tags
         ):
             raise ValueError("标签不能为空或重复，单个标签最多 30 字")
-            raise ValueError("语言不能重复")
         if not any(t.sample for t in self.tests):
             raise ValueError("至少需要一个样例")
         if self.checker == "spj" and not self.checker_source.strip():
@@ -294,6 +293,13 @@ def save_run(
         raise HTTPException(409, "评测 ID 已被其他内容使用")
     db.commit()
     return {"id": row.id, "source": "client", "verdict": row.verdict}
+
+
+@router.get("/learning/progress")
+def my_progress(db: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    from ..learning_helpers import learn_done_keys
+
+    return {"solved_problem_ids": sorted(int(key) for key in learn_done_keys(db, user.id))}
 
 
 @router.get("/learning/runs")

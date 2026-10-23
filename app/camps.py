@@ -10,11 +10,11 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
-from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, func, select
 
 from . import notifications
 from .daytime import CST
+from .learning_helpers import learn_done_by_user
 from .models import (
     Account,
     Camp,
@@ -105,9 +105,16 @@ def can_register(session: Session, *, camp: Camp, user_id: int) -> tuple[bool, s
             return False, "这份集训还没出题"
         return True, ""
     missing = needed - verified_platforms(session, user_id)
-    missing = needed - verified_platforms(session, user_id)
     labels = "、".join(Platform.LABELS.get(p, p) for p in sorted(missing))
-    if missing == needed:
+    has_learning = (
+        session.exec(
+            select(CampProblem.id)
+            .where(CampProblem.camp_id == camp.id, CampProblem.platform == Platform.LEARN)
+            .limit(1)
+        ).first()
+        is not None
+    )
+    if missing == needed and not has_learning:
         return False, f"请先绑定并验证至少一个账号：{labels}"
     return True, f"尚未验证 {labels} 账号，这些平台的成绩暂不能同步" if missing else ""
 
@@ -235,31 +242,19 @@ def leaderboard(session: Session, camp: Camp) -> list[tuple[User, int, dict[str,
         solved.setdefault(uid, set()).update(
             (platform, normalize_key(platform, str(k))) for k in json.loads(payload)
         )
-    # 题库题的完成记录来自 LearningRun 自报 AC——邀请制集训信任这个口径，
-    # 前端会在榜单上标「自报」。正式库可能没装 learning 表，查询失败按空处理。
-    learn_done: dict[int, set[str]] = {}
-    if any(p.platform == Platform.LEARN for p in problems):
-        try:
-            from .learning_models import LearningRun, LearningVersion
-
-            learn_rows = session.exec(
-                select(LearningRun.user_id, LearningVersion.problem_id)
-                .join(LearningVersion, LearningRun.version_id == LearningVersion.id)
-                .where(LearningRun.user_id.in_([u.id for u in users]), LearningRun.verdict == "AC")
-            ).all()
-            for uid, pid in learn_rows:
-                learn_done.setdefault(uid, set()).add(str(pid))
-        except OperationalError:
-            pass
+    # 题库题与其他平台使用同一截止时间，历史通过计分，截止后的提交不计分。
+    learn_done = (
+        learn_done_by_user(session, [u.id for u in users], through=camp.end_at)
+        if any(p.platform == Platform.LEARN for p in problems)
+        else {}
+    )
     rows = []
     for user in users:
         done = solved.get(user.id, set())
         learn = learn_done.get(user.id, set())
         per_problem = {
             f"{p.platform}:{p.key}": (
-                str(p.key) in learn
-                if p.platform == Platform.LEARN
-                else (p.platform, p.key) in done
+                str(p.key) in learn if p.platform == Platform.LEARN else (p.platform, p.key) in done
             )
             for p in problems
         }
@@ -344,14 +339,16 @@ def prepare_finalizations(session: Session) -> None:
         ).all()
         problems = session.exec(
             select(CampProblem)
-            .where(CampProblem.camp_id == camp.id, CampProblem.platform != Platform.LEARN)
+            .where(CampProblem.camp_id == camp.id)
             .order_by(CampProblem.position, CampProblem.id)
         ).all()
-        # 本地练习题不进封榜成绩——它的 AC 是客户端自报的，不能当正式分数。
+        # 冻结全部题目；仅外部平台账号需要最终同步。
         accounts = session.exec(
             select(Account).where(
                 Account.user_id.in_([u.id for u in users]),
-                Account.platform.in_({p.platform for p in problems}),
+                Account.platform.in_(
+                    {p.platform for p in problems if p.platform != Platform.LEARN}
+                ),
                 Account.verified_at.is_not(None),
             )
         ).all()
@@ -464,6 +461,27 @@ def finish_finalizations(session: Session) -> None:
             )
         rows = json.loads(result.participants_json)
         keys = json.loads(result.problems_json)
+        # 兼容升级前已进入最终同步、尚未封榜的任务；截止后题单已锁定。
+        # 只在首次完成结算时补齐遗漏的题库列，已封榜快照不经过此分支。
+        for problem in session.exec(
+            select(CampProblem)
+            .where(CampProblem.camp_id == result.camp_id, CampProblem.platform == Platform.LEARN)
+            .order_by(CampProblem.position, CampProblem.id)
+        ).all():
+            key = f"{Platform.LEARN}:{problem.key}"
+            if key not in keys:
+                keys.append(key)
+        if any(key.startswith(f"{Platform.LEARN}:") for key in keys):
+            camp = session.get(Camp, result.camp_id)
+            if camp is None:
+                continue
+            learning = learn_done_by_user(
+                session, [row["user_id"] for row in rows], through=camp.end_at
+            )
+            for uid, problem_ids in learning.items():
+                solved.setdefault(uid, set()).update(
+                    f"{Platform.LEARN}:{problem_id}" for problem_id in problem_ids
+                )
         for row in rows:
             row["per_problem"] = {key: key in solved.get(row["user_id"], set()) for key in keys}
             row["solved_count"] = sum(row["per_problem"].values())
@@ -482,7 +500,9 @@ def finish_finalizations(session: Session) -> None:
                 CampFinalization.camp_id == result.camp_id,
                 CampFinalization.finalized_at.is_(None),
             )
-            .values(standings_json=json.dumps(rows), finalized_at=now)
+            .values(
+                problems_json=json.dumps(keys), standings_json=json.dumps(rows), finalized_at=now
+            )
         )
         notifications.resolve(session, key)
 
@@ -548,12 +568,6 @@ def detail_for_user(session: Session, camp: Camp, user: User | None) -> dict:
         board = standings(session, camp)
         mine = next((r["per_problem"] for r in board if r["user_id"] == user.id), {})
         result["leaderboard"] = board
-    # 本地练习的完成标记来自本人客户端 AC 记录（自报），仅供展示，不进榜。
-    if user is not None and any(p.platform == Platform.LEARN for p in problems):
-        from .learning_helpers import learn_done_keys
-
-        for key in learn_done_keys(session, user.id):
-            mine[f"{Platform.LEARN}:{key}"] = True
     # 截止即公开题单，最终同步/封榜不阻塞查看；成绩仍仅供已报名成员查看。
     if now >= camp.end_at or (registered and now >= camp.start_at):
         meta = problem_meta(session, problems)

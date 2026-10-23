@@ -527,6 +527,24 @@ def admin_detail(
     )
 
 
+@router.get("/admin/camps/{camp_id}/learning-score-audit")
+def admin_learning_score_audit(
+    camp_id: int,
+    session: Session = Depends(get_session),
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """只读预览旧封榜遗漏的题库列，不修改历史成绩。"""
+    from ..learning_camp_repair import LearningRepairError, learning_repair_plan
+
+    camp = session.get(Camp, camp_id)
+    if camp is None:
+        raise HTTPException(status_code=404, detail="没有这份集训")
+    try:
+        return learning_repair_plan(session, camp).summary
+    except LearningRepairError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
 @router.post("/admin/camps/{camp_id}/problems", status_code=status.HTTP_201_CREATED)
 def admin_add_problem(
     camp_id: int,
@@ -610,6 +628,8 @@ def _cache_imported_problems(keys: list[tuple[str, str]]) -> None:
 
                 try:
                     upsert_learn_cache(db, learn_problem_or_400(db, key))
+                    # 下一项可能访问外部平台，先提交元信息并释放写锁。
+                    db.commit()
                 except HTTPException:
                     continue
                 continue
