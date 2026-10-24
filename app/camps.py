@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
@@ -32,6 +33,13 @@ from .problems import normalize_key, problem_url
 
 class CampError(Exception):
     """带有用户提示的集训业务错误。"""
+
+
+def is_restricted_problem(platform: str, key: str) -> bool:
+    """洛谷 U/T 自建题禁止新增到集训；UVA 等其他题号不受影响。"""
+    return (
+        platform == Platform.LUOGU and re.fullmatch(r"[UT][0-9]+", key, re.IGNORECASE) is not None
+    )
 
 
 def lock_camp(session: Session, camp_id: int) -> Camp | None:

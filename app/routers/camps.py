@@ -565,6 +565,8 @@ def admin_add_problem(
     key = normalize_key(payload.platform, payload.key)
     if not key or len(key) > 128:
         raise HTTPException(status_code=400, detail="请输入有效题号（最多 128 字符）")
+    if camps_mod.is_restricted_problem(payload.platform, key):
+        raise HTTPException(status_code=400, detail="集训不支持添加洛谷 U/T 题")
     # 本地练习先确认题目已发布，失败在写入之前拒绝。
     if payload.platform == Platform.LEARN:
         from ..learning_helpers import learn_problem_or_400
@@ -612,7 +614,8 @@ class ProblemImport(BaseModel):
     - ``problem_list_id``：从已有题单整单拉题；合集会把里面所有题单的题
       一起拉平
 
-    重复的就跳过，别一条报错把整个导入打死。
+    重复项跳过；洛谷 U/T 题单独列入 excluded，其余有效题照常导入。
+    不会因为一条被排除的题目拒绝整批导入。
     """
 
     items: list[ProblemAdd] = Field(default_factory=list, max_length=2000)
@@ -700,6 +703,8 @@ def admin_import_problems(
     added_keys: list[tuple[str, str]] = []
     skipped = 0
     failed: list[str] = []
+    excluded: list[str] = []
+    excluded_keys: set[tuple[str, str]] = set()
     from ..learning_helpers import learning_enabled
 
     for platform, raw_key in source:
@@ -709,6 +714,11 @@ def admin_import_problems(
         key = normalize_key(platform, raw_key)
         if not key or len(key) > 128:
             failed.append(f"{platform}:{raw_key}")
+            continue
+        if camps_mod.is_restricted_problem(platform, key):
+            if (platform, key) not in excluded_keys:
+                excluded.append(f"{platform}:{key}")
+                excluded_keys.add((platform, key))
             continue
         if (platform, key) in existing:
             skipped += 1
@@ -735,11 +745,14 @@ def admin_import_problems(
     else:
         session.commit()  # 全部重复也释放写锁；不重置账号同步时间。
 
-    return {
+    result = {
         "added": len(added_keys),
         "skipped": skipped,
         "failed": failed,
     }
+    if excluded:
+        result["excluded"] = excluded
+    return result
 
 
 class ReorderRequest(BaseModel):
