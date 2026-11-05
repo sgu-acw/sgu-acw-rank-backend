@@ -152,6 +152,21 @@ def test_no_automatic_name_binding_and_retroactive_exclusion(client):
     assert client.put(f"/api/honors/admin/users/{p['id']}", json=updated).status_code == 409
 
 
+def test_verified_public_awards_include_unlinked_names_but_personal_history_does_not(client):
+    p = member(client, name="已关联成员")
+    client.post("/api/honors/admin/import", json={"records": [record()], "preview": False})
+    award = client.get("/api/honors/admin/awards").json()[0]
+    assert client.put(
+        f"/api/honors/admin/awards/{award['id']}",
+        json={"revision": award["revision"], "status": "verified", "user_ids": [None]},
+    ).status_code == 200
+
+    public = client.get("/api/honors").json()
+    assert len(public) == 1
+    assert public[0]["recipients"] == [{"name": "旧名"}]
+    assert client.get(f"/api/honors/users/{p['id']}").json() == []
+
+
 def test_personal_history_uses_user_and_keeps_source_after_deletion(client):
     from app.cleanup import delete_user_references
     from app.db import get_engine
@@ -168,7 +183,9 @@ def test_personal_history_uses_user_and_keeps_source_after_deletion(client):
         recipient = db.exec(select(HonorRecipient)).one()
         assert recipient.user_id is None
         assert recipient.raw_name == "旧名"
-    assert client.get("/api/honors").json() == []
+    public = client.get("/api/honors").json()
+    assert len(public) == 1
+    assert public[0]["recipients"] == [{"name": "旧名"}]
 
 
 def test_name_and_former_name_matching_is_provisional_and_respects_enrollment(client):

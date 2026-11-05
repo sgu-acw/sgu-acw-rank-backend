@@ -98,7 +98,9 @@ def award_views(db, *, admin=False, user_id=None):
         for r in recipients.get(a.id, []):
             p = users.get(r.user_id)
             reason = eligibility(p, e)
-            if admin or (a.status == "verified" and reason == "计入"):
+            if admin or (
+                a.status == "verified" and (p is None or reason == "计入")
+            ):
                 member = {"name": p.display_name if p else r.raw_name}
                 if admin:
                     candidates, suggested = match_candidates(r.raw_name, e, users, index)
