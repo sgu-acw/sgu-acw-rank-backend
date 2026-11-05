@@ -1,4 +1,4 @@
-"""Honor identities are independent of login accounts; names are never unique keys."""
+"""Awards link directly to users; the old identity table is retained for migration."""
 
 from datetime import date
 
@@ -51,3 +51,4 @@ class HonorRecipient(SQLModel, table=True):
     position: int
     raw_name: str = Field(max_length=100)
     person_id: int | None = Field(default=None, foreign_key="honor_people.id", index=True)
+    user_id: int | None = Field(default=None, foreign_key="users.id", index=True)

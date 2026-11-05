@@ -81,6 +81,8 @@ def missing_columns() -> dict[str, list[tuple[str, str]]]:
             # 多数情况下 None 恰好是 falsy 所以看不出问题，但那是运气——
             # 例如 consecutive_failures 参与乘法时会直接报错。
             default = _default_clause(column)
+            if table_name == "honor_recipients" and column.name == "user_id":
+                default += ' REFERENCES "users" ("id")'
             missing.append((column.name, f"{col_type}{default}"))
         if missing:
             result[table_name] = missing
@@ -309,6 +311,58 @@ def _widen_daily_solve_constraint(*, check_only: bool = False) -> int:
     return 1
 
 
+def _migrate_honor_users(*, check_only: bool = False) -> int:
+    """Move only explicitly linked legacy identities; never resolve a name to a user."""
+    import json
+
+    from sqlmodel import Session, select
+
+    from .honor_models import HonorPerson, HonorRecipient
+    from .models import User
+
+    # Check mode may run before the additive columns exist.
+    if any(t in missing_columns() for t in ("users", "honor_recipients")):
+        return 0
+    changed = 0
+    with Session(get_engine()) as db:
+        if not check_only:
+            from sqlalchemy import update
+
+            db.execute(update(User).where(User.id == -1).values(honor_revision=User.honor_revision))
+        for person in db.exec(select(HonorPerson)).all():
+            if not person.user_id or person.merged_into_id:
+                continue
+            user = db.get(User, person.user_id)
+            if user is None:
+                continue
+            if user.honor_revision == 1:
+                changed += 1
+                if not check_only:
+                    names = json.loads(person.aliases_json)
+                    if person.name != user.display_name:
+                        names.append(person.name)
+                    user.former_names_json = json.dumps(
+                        list(dict.fromkeys(names)), ensure_ascii=False
+                    )
+                    user.honor_study_start = person.study_start
+                    user.honor_study_end = person.study_end
+                    user.honor_revision += 1
+                    db.add(user)
+            for recipient in db.exec(
+                select(HonorRecipient).where(
+                    HonorRecipient.person_id == person.id, HonorRecipient.user_id.is_(None)
+                )
+            ).all():
+                changed += 1
+                if not check_only:
+                    recipient.user_id = user.id
+                    recipient.person_id = None
+                    db.add(recipient)
+        if not check_only:
+            db.commit()
+    return changed
+
+
 def run_migration(*, check_only: bool = False) -> int:
     """补列。返回补了几列。"""
     init_db()  # 先把缺的表建出来
@@ -326,7 +380,7 @@ def run_migration(*, check_only: bool = False) -> int:
     pending = missing_columns()
     if not pending:
         logger.info("没有缺的列")
-        return renamed + widened + fixed + normalized
+        return renamed + widened + fixed + normalized + _migrate_honor_users(check_only=check_only)
 
     total = normalized
     for table_name, columns in pending.items():
@@ -345,7 +399,7 @@ def run_migration(*, check_only: bool = False) -> int:
                 connection.exec_driver_sql(statement)
             total += 1
 
-    return renamed + widened + total + fixed
+    return renamed + widened + total + fixed + _migrate_honor_users(check_only=check_only)
 
 
 def main() -> None:

@@ -10,7 +10,7 @@ annotations``. Postponed evaluation turns the ``Relationship`` annotations into
 plain strings, which SQLModel cannot resolve back to the related class.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import ClassVar
 
 from sqlmodel import Field, Relationship, SQLModel, UniqueConstraint
@@ -86,6 +86,12 @@ class User(SQLModel, table=True):
     student_id: str = Field(index=True, unique=True, max_length=16)
     password_hash: str
     display_name: str = Field(max_length=64)
+
+    # Admin-maintained name history and enrollment overrides for award review.
+    former_names_json: str = "[]"
+    honor_study_start: date | None = None
+    honor_study_end: date | None = None
+    honor_revision: int = 1
 
     enroll_year: int
     level: int

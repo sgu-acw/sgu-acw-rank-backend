@@ -1,18 +1,18 @@
-"""Public honors and an admin-only review queue. Imports append without name matching."""
+"""Public honors and admin review with provisional user-name matching."""
 
 import json
 from datetime import date
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StringConstraints, model_validator
 from sqlalchemy import update
 from sqlmodel import Session, select
 
 from ..db import get_session
 from ..deps import get_current_user, require_admin, require_origin_secret
-from ..honor_models import HonorAward, HonorEvent, HonorPerson, HonorRecipient
-from ..honors import eligibility, study_end
+from ..honor_models import HonorAward, HonorEvent, HonorRecipient
+from ..honors import eligibility, match_candidates, name_index, study_start, user_view
 from ..models import User
 
 router = APIRouter(prefix="/honors", tags=["honors"], dependencies=[Depends(require_origin_secret)])
@@ -24,21 +24,18 @@ class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class PersonInput(Input):
-    name: Text
-    aliases: list[Text] = Field(default_factory=list, max_length=30)
-    user_id: int | None = Field(default=None, gt=0)
+class UserProfileInput(Input):
+    former_names: list[Text] = Field(default_factory=list, max_length=30)
     study_start: date | None = None
     study_end: date | None = None
-    note: str = Field(default="", max_length=3000)
-    revision: int | None = None
+    revision: int = Field(ge=1)
 
     @model_validator(mode="after")
     def dates(self):
-        if self.study_end and (not self.study_start or self.study_end <= self.study_start):
-            raise ValueError("离校日期必须晚于入学日期")
         if self.study_start and self.study_start.year > 9995:
             raise ValueError("入学日期超出支持范围")
+        if self.study_end and self.study_start and self.study_end <= self.study_start:
+            raise ValueError("离校日期必须晚于入学日期")
         return self
 
 
@@ -78,15 +75,7 @@ class EventDateInput(Input):
 class ReviewInput(Input):
     revision: int
     status: Literal["pending", "verified", "excluded"]
-    person_ids: list[int | None] = Field(max_length=30)
-
-
-def person_view(p):
-    return {
-        **p.model_dump(exclude={"aliases_json"}),
-        "aliases": json.loads(p.aliases_json),
-        "effective_study_end": study_end(p),
-    }
+    user_ids: list[int | None] = Field(max_length=30)
 
 
 def lock(db):
@@ -95,12 +84,9 @@ def lock(db):
     db.expire_all()
 
 
-def people_map(db):
-    return {p.id: p for p in db.exec(select(HonorPerson)).all()}
-
-
 def award_views(db, *, admin=False, user_id=None):
-    people = people_map(db)
+    users = {u.id: u for u in db.exec(select(User)).all()}
+    index = name_index(list(users.values())) if admin else {}
     recipients = {}
     for r in db.exec(select(HonorRecipient).order_by(HonorRecipient.position)).all():
         recipients.setdefault(r.award_id, []).append(r)
@@ -110,18 +96,25 @@ def award_views(db, *, admin=False, user_id=None):
         e = events[a.event_id]
         members = []
         for r in recipients.get(a.id, []):
-            p = people.get(r.person_id)
+            p = users.get(r.user_id)
             reason = eligibility(p, e)
             if admin or (a.status == "verified" and reason == "计入"):
-                member = {"name": p.name if p else r.raw_name, "person_id": r.person_id}
+                member = {"name": p.display_name if p else r.raw_name}
                 if admin:
-                    member.update(raw_name=r.raw_name, eligibility=reason)
+                    candidates, suggested = match_candidates(r.raw_name, e, users, index)
+                    member.update(
+                        raw_name=r.raw_name,
+                        eligibility=reason,
+                        user_id=r.user_id,
+                        candidates=candidates,
+                        suggested_user_id=suggested,
+                    )
                 members.append(member)
         if not admin and (a.status != "verified" or not members):
             continue
         if user_id is not None and not any(
-            people.get(m["person_id"]) and people[m["person_id"]].user_id == user_id
-            for m in members
+            r.user_id == user_id and eligibility(users.get(r.user_id), e) == "计入"
+            for r in recipients.get(a.id, [])
         ):
             continue
         item = {
@@ -156,45 +149,39 @@ def user_honors(
     return award_views(db, user_id=user_id)
 
 
-@router.get("/admin/people", dependencies=[Depends(require_admin)])
-def list_people(db: Session = Depends(get_session)):
-    return [person_view(p) for p in db.exec(select(HonorPerson)).all()]
+@router.get("/admin/users", dependencies=[Depends(require_admin)])
+def list_users(db: Session = Depends(get_session)):
+    users = db.exec(select(User).order_by(User.enroll_year.desc(), User.student_id)).all()
+    return [user_view(u) for u in users]
 
 
-def save_person(db, data, person_id=None):
+@router.get("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
+def get_user_profile(user_id: int, db: Session = Depends(get_session)):
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "成员不存在")
+    return user_view(user)
+
+
+@router.put("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
+def update_user_profile(user_id: int, data: UserProfileInput, db: Session = Depends(get_session)):
     lock(db)
-    person = db.get(HonorPerson, person_id) if person_id is not None else None
-    if person_id is not None and person is None:
-        raise HTTPException(404, "身份不存在")
-    if person:
-        db.refresh(person)
-        if person.merged_into_id or person.revision != data.revision:
-            raise HTTPException(409, "身份已更新，请重新打开后编辑")
-    if data.user_id:
-        if db.get(User, data.user_id) is None:
-            raise HTTPException(404, "关联的站内成员不存在")
-        existing = db.exec(select(HonorPerson).where(HonorPerson.user_id == data.user_id)).first()
-        if existing and (not person or existing.id != person.id):
-            raise HTTPException(409, "这个站内成员已关联其他身份，请核对重名或曾用名")
-    p = person or HonorPerson(name=data.name)
-    for k, v in data.model_dump(exclude={"aliases", "revision"}).items():
-        setattr(p, k, v)
-    p.aliases_json = json.dumps(list(dict.fromkeys(data.aliases)), ensure_ascii=False)
-    p.revision += 1 if person else 0
-    db.add(p)
+    user = db.get(User, user_id)
+    if user is None:
+        raise HTTPException(404, "成员不存在")
+    if user.honor_revision != data.revision:
+        raise HTTPException(409, "用户获奖资料已更新，请重新打开后编辑")
+    user.honor_study_start = data.study_start
+    user.honor_study_end = data.study_end
+    start = study_start(user)
+    if data.study_end and (not start or data.study_end <= start):
+        raise HTTPException(422, "离校日期必须晚于入学日期，请核对默认或填写的入学日期")
+    user.former_names_json = json.dumps(list(dict.fromkeys(data.former_names)), ensure_ascii=False)
+    user.honor_revision += 1
+    db.add(user)
     db.commit()
-    db.refresh(p)
-    return person_view(p)
-
-
-@router.post("/admin/people", dependencies=[Depends(require_admin)])
-def create_person(data: PersonInput, db: Session = Depends(get_session)):
-    return save_person(db, data)
-
-
-@router.put("/admin/people/{person_id}", dependencies=[Depends(require_admin)])
-def update_person(person_id: int, data: PersonInput, db: Session = Depends(get_session)):
-    return save_person(db, data, person_id)
+    db.refresh(user)
+    return user_view(user)
 
 
 @router.get("/admin/awards", dependencies=[Depends(require_admin)])
@@ -265,44 +252,22 @@ def review_award(award_id: int, data: ReviewInput, db: Session = Depends(get_ses
         .where(HonorRecipient.award_id == award_id)
         .order_by(HonorRecipient.position)
     ).all()
-    if len(recipients) != len(data.person_ids):
+    if len(recipients) != len(data.user_ids):
         raise HTTPException(422, "获奖者人数不匹配")
-    assigned = [i for i in data.person_ids if i is not None]
+    assigned = [i for i in data.user_ids if i is not None]
     if len(assigned) != len(set(assigned)):
         raise HTTPException(422, "同一条获奖记录不能重复关联同一个人")
-    for r, person_id in zip(recipients, data.person_ids, strict=True):
-        if person_id is not None:
-            p = db.get(HonorPerson, person_id)
-            if p is None or p.merged_into_id:
-                raise HTTPException(422, "关联身份不存在或已经合并")
-        r.person_id = person_id
+    for r, user_id in zip(recipients, data.user_ids, strict=True):
+        if user_id is not None and db.get(User, user_id) is None:
+            raise HTTPException(422, "关联用户不存在")
+        r.user_id = user_id
+        r.person_id = None
         db.add(r)
     award.status = data.status
     award.revision += 1
     db.add(award)
     db.commit()
     return {"id": award.id, "revision": award.revision}
-
-
-@router.get("/admin/people/{person_id}/merge-preview", dependencies=[Depends(require_admin)])
-def merge_preview(person_id: int, target_id: int = Query(gt=0), db: Session = Depends(get_session)):
-    source, target = db.get(HonorPerson, person_id), db.get(HonorPerson, target_id)
-    if not source or not target:
-        raise HTTPException(404, "身份不存在")
-    if person_id == target_id or source.merged_into_id or target.merged_into_id:
-        raise HTTPException(422, "请选择两个尚未合并的不同身份")
-    conflicts = []
-    if source.user_id and target.user_id and source.user_id != target.user_id:
-        conflicts.append("关联了不同登录账号")
-    if (source.study_start, study_end(source)) != (target.study_start, study_end(target)):
-        conflicts.append("在校区间不同")
-    return {
-        "source": person_view(source),
-        "target": person_view(target),
-        "conflicts": conflicts,
-        "executable": False,
-        "reason": "已预留身份合并接口；执行及审计功能尚未开放",
-    }
 
 
 @router.put("/admin/events/{event_id}/date", dependencies=[Depends(require_admin)])
