@@ -541,6 +541,77 @@ def test_nowcoder_survives_one_source_failing(env):
     assert set(solved.problems) == {"nowcoder:contest:318505"}
 
 
+def test_nowcoder_successfully_reads_empty_solved_set(env):
+    """两路数据都正常读取但没有 AC 时，应成功返回空集合。"""
+    from app.platforms import fetch_solved_nowcoder
+
+    contest_page = """
+    <table><tbody>
+    <tr><td>1</td><td><a href="/acm/problem/318505">题目甲</a></td>
+        <td>运行超时</td><td>0</td><td>1</td>
+        <td>1</td><td>1</td><td>PyPy3</td><td>2026-08-20 10:00:00</td></tr>
+    </tbody></table>
+    """
+
+    class FakeResponse:
+        status_code = 200
+        text = contest_page
+
+        @staticmethod
+        def json():
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "total": 1,
+                    "records": [
+                        {
+                            "problem": {"questionUuid": "uuid-abc", "title": "多组输入"},
+                            "accept": False,
+                            "submission": {"createdDate": 1790932328000},
+                        }
+                    ],
+                },
+            }
+
+    class FakeClient:
+        def get(self, *args, **kwargs):
+            return FakeResponse()
+
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    solved = fetch_solved_nowcoder(FakeClient(), "825377486")
+    assert solved.problems == {}
+
+
+def test_nowcoder_empty_result_with_source_error_still_fails(env):
+    """一路不可用时，另一路的空数据不能证明账号确实没有 AC。"""
+    from app.platforms import FetchError, fetch_solved_nowcoder
+
+    class EmptyResponse:
+        status_code = 200
+        text = "<table><tbody></tbody></table>"
+
+        @staticmethod
+        def json():
+            return {"success": True, "code": 0, "data": {"records": []}}
+
+    class BrokenResponse:
+        status_code = 503
+        text = ""
+
+    class FakeClient:
+        def get(self, *args, **kwargs):
+            return EmptyResponse()
+
+        def post(self, *args, **kwargs):
+            return BrokenResponse()
+
+    with pytest.raises(FetchError, match="牛客主站返回 503"):
+        fetch_solved_nowcoder(FakeClient(), "825377486")
+
+
 # --------------------------------------------------------------------------- #
 # 自适应调度
 # --------------------------------------------------------------------------- #

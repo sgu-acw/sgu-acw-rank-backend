@@ -593,9 +593,9 @@ def fetch_solved_nowcoder(client: httpx.Client, identifier: str) -> SolvedSet:
     except FetchError as exc:
         main_error = exc
 
-    if not problems:
-        # 两边都失败。报第一个错就行，第二个多半是同一个原因。
-        raise contest_error or main_error or FetchError("牛客没有返回任何数据")
+    if not problems and (contest_error or main_error):
+        # 没有任何一边拿到 AC，且至少一路请求失败时，不能把未知状态当成零题。
+        raise contest_error or main_error
 
     # 一边成功一边失败是常见情况（限流、平台改版）。这时候**必须留痕**：
     # 早先静默吞掉，结果快照里少了一半数据而没有任何提示，很难查。
