@@ -30,6 +30,7 @@ from .routers import (
     camps,
     daily,
     editorials,
+    honors,
     learning,
     meta,
     notifications,
@@ -147,6 +148,7 @@ def create_app() -> FastAPI:
     app.include_router(meta.router, prefix=API_PREFIX)
     app.include_router(auth.router, prefix=API_PREFIX)
     app.include_router(users.router, prefix=API_PREFIX)
+    app.include_router(honors.router, prefix=API_PREFIX)
     app.include_router(accounts.router, prefix=API_PREFIX)
     app.include_router(practice.router, prefix=API_PREFIX)
     app.include_router(problemlists.router, prefix=API_PREFIX)

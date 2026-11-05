@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from sqlmodel import Session, select
 
+from .honor_models import HonorPerson
 from .models import (
     Account,
     CampRegistration,
@@ -64,6 +65,12 @@ def delete_user_references(db: Session, user_id: int) -> None:
     ``notification_reads`` 都带外键指向 users，不先清掉的话删用户会被
     数据库拦下。
     """
+    # Public historical achievements survive deletion of the login account.
+    for person in db.exec(select(HonorPerson).where(HonorPerson.user_id == user_id)).all():
+        person.user_id = None
+        person.revision += 1
+        db.add(person)
+    db.flush()
     for model in (
         SignupEntry,
         PasskeyCredential,

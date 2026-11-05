@@ -61,7 +61,7 @@ def init_db() -> None:
     只建表不加列：已有表的新增列由 ``migrate.run_migration`` 补，
     ``create_app`` 启动时会在 init_db 之后跑它。
     """
-    from . import models  # noqa: F401  (import registers the tables)
+    from . import honor_models, models  # noqa: F401  (import registers the tables)
 
     SQLModel.metadata.create_all(get_engine())
 
