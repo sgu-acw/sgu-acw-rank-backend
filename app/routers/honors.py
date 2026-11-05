@@ -12,7 +12,14 @@ from sqlmodel import Session, select
 from ..db import get_session
 from ..deps import get_current_user, require_admin, require_origin_secret
 from ..honor_models import HonorAward, HonorEvent, HonorRecipient
-from ..honors import eligibility, match_candidates, name_index, study_start, user_view
+from ..honors import (
+    eligibility,
+    event_is_complete,
+    match_candidates,
+    name_index,
+    study_start,
+    user_view,
+)
 from ..models import User
 
 router = APIRouter(prefix="/honors", tags=["honors"], dependencies=[Depends(require_origin_secret)])
@@ -99,7 +106,11 @@ def award_views(db, *, admin=False, user_id=None):
             p = users.get(r.user_id)
             reason = eligibility(p, e)
             if admin or (
-                a.status == "verified" and (p is None or reason == "计入")
+                a.status == "verified"
+                and (
+                    (p is None and event_is_complete(e))
+                    or reason == "计入"
+                )
             ):
                 member = {"name": p.display_name if p else r.raw_name}
                 if admin:

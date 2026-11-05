@@ -167,6 +167,18 @@ def test_verified_public_awards_include_unlinked_names_but_personal_history_does
     assert client.get(f"/api/honors/users/{p['id']}").json() == []
 
 
+def test_verified_unlinked_future_award_is_not_public(client):
+    row = record()
+    row["event"]["occurred_on"] = "2099-06-01"
+    client.post("/api/honors/admin/import", json={"records": [row], "preview": False})
+    award = client.get("/api/honors/admin/awards").json()[0]
+    assert client.put(
+        f"/api/honors/admin/awards/{award['id']}",
+        json={"revision": award["revision"], "status": "verified", "user_ids": [None]},
+    ).status_code == 200
+    assert client.get("/api/honors").json() == []
+
+
 def test_personal_history_uses_user_and_keeps_source_after_deletion(client):
     from app.cleanup import delete_user_references
     from app.db import get_engine

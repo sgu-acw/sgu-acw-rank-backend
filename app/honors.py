@@ -33,6 +33,17 @@ def study_end(user: User) -> date | None:
     )
 
 
+def event_is_complete(event: HonorEvent) -> bool:
+    if event.occurred_on is None:
+        return True
+    last_day = event.occurred_on
+    if event.date_precision == "month":
+        last_day = last_day.replace(day=monthrange(last_day.year, last_day.month)[1])
+    elif event.date_precision == "year":
+        last_day = last_day.replace(month=12, day=31)
+    return last_day <= datetime.now(CST).date()
+
+
 def eligibility(user: User | None, event: HonorEvent) -> str:
     if user is None:
         return "待关联用户"
