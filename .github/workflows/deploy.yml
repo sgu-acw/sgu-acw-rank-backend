@@ -47,27 +47,37 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.SGU_ACW_SSH_KEY }}
           SSH_HOST: ${{ secrets.SGU_ACW_SSH_HOST }}
+          SSH_USER: ${{ secrets.SGU_ACW_SSH_USER }}
         run: |
           mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" | python3 -c "import sys; sys.stdout.write(sys.stdin.read().replace('\r\n', '\n').strip() + '\n')" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
+          # Same pinned production host keys as the frontend deploy workflow.
+          # ssh-keyscan intermittently fails from GitHub runners.
+          printf '%s\n' \
+            '154.9.228.109 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOueouNQCFoKLYn0EkXUyp4uRdSzC4Lq2x23nfS9wD6w' \
+            '154.9.228.109 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHqfRQzBYzSuGi1VB9trjC+clDp5J5QRTd+4bf0Vkxd0rqj9x2ipgRodyp+Ty4Fp2kF6VkglrS3Uj7ht7f2Loa0=' \
+            > ~/.ssh/known_hosts
+          printf 'Host deploy-target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  ConnectTimeout 15\n' \
+            "$SSH_HOST" "$SSH_USER" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
 
       - name: Rsync and restart
-        env:
-          SSH_USER: ${{ secrets.SGU_ACW_SSH_USER }}
-          SSH_HOST: ${{ secrets.SGU_ACW_SSH_HOST }}
         run: |
           rsync -az --delete-delay \
-            -e "ssh -i ~/.ssh/id_ed25519" \
-            app/ "$SSH_USER@$SSH_HOST:$REMOTE_DIR/app/"
+            -e ssh \
+            app/ "deploy-target:$REMOTE_DIR/app/"
           rsync -az \
-            -e "ssh -i ~/.ssh/id_ed25519" \
-            pyproject.toml uv.lock "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
-          ssh -i ~/.ssh/id_ed25519 "$SSH_USER@$SSH_HOST" \
+            -e ssh \
+            pyproject.toml uv.lock "deploy-target:$REMOTE_DIR/"
+          ssh deploy-target \
             "cd $REMOTE_DIR \
               && $UV_BIN sync --frozen \
               && .venv/bin/python -m compileall -q app \
               && systemctl restart sgu-acw-api.service \
-              && sleep 3 \
-              && curl -fsS http://127.0.0.1:8091/api/healthz"
+              && for attempt in \$(seq 1 30); do \
+                curl -fsS --max-time 2 http://127.0.0.1:8091/api/healthz && exit 0; \
+                sleep 2; \
+              done; \
+              journalctl -u sgu-acw-api.service -n 40 --no-pager; exit 1"
