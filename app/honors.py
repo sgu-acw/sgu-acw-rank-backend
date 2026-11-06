@@ -39,8 +39,6 @@ def event_is_complete(event: HonorEvent) -> bool:
     last_day = event.occurred_on
     if event.date_precision == "month":
         last_day = last_day.replace(day=monthrange(last_day.year, last_day.month)[1])
-    elif event.date_precision == "year":
-        last_day = last_day.replace(month=12, day=31)
     return last_day <= datetime.now(CST).date()
 
 
@@ -64,7 +62,7 @@ def eligibility(user: User | None, event: HonorEvent) -> str:
         return "不在在校时间内"
     if first < start or (end and last >= end):
         return "日期精度不足，需核对边界"
-    if last > datetime.now(CST).date():
+    if not event_is_complete(event):
         return "比赛尚未结束"
     return "计入"
 

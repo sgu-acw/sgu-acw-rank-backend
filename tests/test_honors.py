@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
 from app.honor_models import HonorAward, HonorEvent, HonorPerson, HonorRecipient
-from app.honors import eligibility, study_end
+from app.honors import eligibility, event_is_complete, study_end
 from app.models import User
 
 
@@ -111,6 +111,20 @@ def test_calendar_boundaries_and_precision():
     assert eligibility(p, event(None)) == "待核实比赛日期"
     assert eligibility(None, event(date(2024, 1, 1))) == "待关联用户"
     assert study_end(User(honor_study_start=date(2020, 2, 29))) == date(2024, 2, 29)
+
+
+def test_current_year_awards_are_not_hidden_as_future():
+    today = date.today()
+    current_year = HonorEvent(
+        key="year", title="year", family="astar",
+        occurred_on=date(today.year, 1, 1), date_precision="year",
+    )
+    future = HonorEvent(
+        key="future", title="future", family="matibei",
+        occurred_on=date(today.year + 1, 8, 2), date_precision="day",
+    )
+    assert event_is_complete(current_year)
+    assert not event_is_complete(future)
 
 
 def test_import_preview_duplicate_and_conflicting_events(client):
