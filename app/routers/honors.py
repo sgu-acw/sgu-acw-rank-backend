@@ -79,6 +79,11 @@ class EventDateInput(Input):
     expected_date_precision: Literal["day", "month", "year"]
 
 
+class EventCategoryInput(Input):
+    category: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]
+    expected_category: str = Field(max_length=200)
+
+
 class ReviewInput(Input):
     revision: int
     status: Literal["pending", "verified", "excluded"]
@@ -296,5 +301,22 @@ def update_event_date(event_id: int, data: EventDateInput, db: Session = Depends
         raise HTTPException(409, "比赛日期已更新，请重新打开后编辑")
     event.occurred_on, event.date_precision = data.occurred_on, data.date_precision
     db.add(event)
+    db.commit()
+    return event
+
+
+@router.put("/admin/events/{event_id}/category", dependencies=[Depends(require_admin)])
+def update_event_category(
+    event_id: int, data: EventCategoryInput, db: Session = Depends(get_session)
+):
+    lock(db)
+    event = db.get(HonorEvent, event_id)
+    if event is None:
+        raise HTTPException(404, "赛事不存在")
+    if event.category != data.expected_category:
+        raise HTTPException(409, "赛事组别已更新，请重新打开后编辑")
+    if event.category != data.category:
+        event.category = data.category
+        db.add(event)
     db.commit()
     return event

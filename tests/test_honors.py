@@ -446,3 +446,47 @@ def test_legacy_migration_preserves_explicit_links_but_does_not_guess(client):
     )
     assert run_migration() == 0
     assert client.get(f"/api/honors/admin/users/{p['id']}").json()["former_names"] == []
+
+
+def test_category_correction_preserves_awards_and_rejects_stale_writer(client):
+    from app.main import create_app
+
+    p = member(client)
+    a = publish(client, p)
+    url = f"/api/honors/admin/events/{a['event']['id']}/category"
+    before = client.get("/api/honors/admin/awards").json()[0]
+    body = {"category": "全国总决赛 · Java软件开发大学B组", "expected_category": ""}
+    assert client.put(url, json=body).status_code == 200
+    after = client.get("/api/honors/admin/awards").json()[0]
+    assert after["event"]["category"] == body["category"]
+    assert {k: v for k, v in before.items() if k != "event"} == {
+        k: v for k, v in after.items() if k != "event"
+    }
+    assert client.put(url, json=body).status_code == 409
+    assert client.put(url, json={**body, "expected_category": body["category"]}).status_code == 200
+    assert client.put(url, json={**body, "category": "x" * 201}).status_code == 422
+    assert client.put("/api/honors/admin/events/999999/category", json=body).status_code == 404
+    with TestClient(create_app()) as anonymous:
+        assert anonymous.put(url, json=body).status_code == 401
+
+
+def test_two_category_writers_preserve_first_save(client):
+    from fastapi import HTTPException
+    from app.db import get_engine
+    from app.routers.honors import EventCategoryInput, update_event_category
+
+    a = publish(client, member(client))
+
+    def submit(category):
+        with Session(get_engine()) as db:
+            try:
+                update_event_category(
+                    a["event"]["id"],
+                    EventCategoryInput(category=category, expected_category=""), db,
+                )
+                return 200
+            except HTTPException as e:
+                return e.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(submit, ["Java B组", "Python B组"])) == [200, 409]
