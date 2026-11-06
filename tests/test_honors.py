@@ -472,6 +472,7 @@ def test_category_correction_preserves_awards_and_rejects_stale_writer(client):
 
 def test_two_category_writers_preserve_first_save(client):
     from fastapi import HTTPException
+
     from app.db import get_engine
     from app.routers.honors import EventCategoryInput, update_event_category
 
