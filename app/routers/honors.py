@@ -105,6 +105,8 @@ def award_views(db, *, admin=False, user_id=None):
     events = {e.id: e for e in db.exec(select(HonorEvent)).all()}
     result = []
     for a in db.exec(select(HonorAward).order_by(HonorAward.id.desc())).all():
+        if not admin and a.award.strip() == "优秀奖":
+            continue
         e = events[a.event_id]
         members = []
         for r in recipients.get(a.id, []):

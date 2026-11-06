@@ -181,6 +181,32 @@ def test_verified_public_awards_include_unlinked_names_but_personal_history_does
     assert client.get(f"/api/honors/users/{p['id']}").json() == []
 
 
+def test_excellence_awards_stay_in_admin_but_not_public_or_personal_history(client):
+    p = member(client, name="旧名")
+    records = [record("bronze"), record("excellence-linked"), record("excellence-unlinked")]
+    for row in records[1:]:
+        row["award"] = "优秀奖"
+    r = client.post("/api/honors/admin/import", json={"records": records, "preview": False})
+    assert r.status_code == 200, r.text
+    for award in client.get("/api/honors/admin/awards").json():
+        r = client.put(
+            f"/api/honors/admin/awards/{award['id']}",
+            json={
+                "revision": award["revision"], "status": "verified",
+                "user_ids": [None if award["source_key"] == "excellence-unlinked" else p["id"]],
+            },
+        )
+        assert r.status_code == 200, r.text
+    for url in ["/api/honors", f"/api/honors/users/{p['id']}"]:
+        rows = client.get(url).json()
+        assert len(rows) == 1
+        assert rows[0]["award"] == "铜奖"
+    admin = client.get("/api/honors/admin/awards").json()
+    assert len(admin) == 3
+    assert all(a["status"] == "verified" for a in admin)
+    assert sum(a["award"] == "优秀奖" for a in admin) == 2
+
+
 def test_verified_unlinked_future_award_is_not_public(client):
     row = record()
     row["event"]["occurred_on"] = "2099-06-01"
