@@ -162,6 +162,8 @@ def register(
     user = session.get(User, user_id)
     if user is None or not user.is_active:
         raise CampError("成员不存在或已停用")
+    if user.is_external:
+        raise CampError("校外账号不可报名校内集训")
     existing = session.exec(
         select(CampRegistration).where(
             CampRegistration.camp_id == camp.id, CampRegistration.user_id == user_id

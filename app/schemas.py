@@ -89,6 +89,22 @@ class RegisterRequest(BaseModel):
         return cleaned
 
 
+class ExternalRegisterRequest(BaseModel):
+    """校外人员自助注册：无需学号和邀请码，使用自定义用户名。"""
+
+    username: str = Field(min_length=3, max_length=16)
+    display_name: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("display_name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("昵称不能为空")
+        return cleaned
+
+
 class LoginRequest(BaseModel):
     student_id: str = Field(min_length=1, max_length=16)
     password: str = Field(min_length=1, max_length=128)
@@ -128,8 +144,8 @@ class InviteCreate(BaseModel):
     @field_validator("grants_role")
     @classmethod
     def _known_role(cls, value: str) -> str:
-        if value not in Role.ALL:
-            raise ValueError("未知的角色")
+        if value not in Role.CAMPUS:
+            raise ValueError("邀请码只能授予校内角色")
         return value
 
 

@@ -33,8 +33,11 @@ class Role:
     ROOT = "root"
     ADMIN = "admin"
     MEMBER = "member"
+    EXTERNAL = "external"
 
-    ALL = (ROOT, ADMIN, MEMBER)
+    ALL = (ROOT, ADMIN, MEMBER, EXTERNAL)
+    #: 校内成员（含管理员与 root），可访问站内榜单、集训、报名和成员信息。
+    CAMPUS = (ROOT, ADMIN, MEMBER)
     #: Roles that may reach the admin endpoints.
     ADMINISTRATIVE = (ROOT, ADMIN)
 
@@ -144,13 +147,25 @@ class User(SQLModel, table=True):
         return self.role == Role.ROOT
 
     @property
+    def is_external(self) -> bool:
+        return self.role == Role.EXTERNAL
+
+    @property
+    def is_campus_member(self) -> bool:
+        return self.role in Role.CAMPUS
+
+    @property
     def college_name(self) -> str | None:
         """学院名。人工改过就用改的，否则按学号里的码查表。"""
+        if self.is_external:
+            return None
         return self.college_override or academic.college_name(self.college_code)
 
     @property
     def major_name(self) -> str | None:
         """专业名。同上。"""
+        if self.is_external:
+            return None
         return self.major_override or academic.major_name(self.college_code, self.major_code)
 
     @property
@@ -168,7 +183,7 @@ class User(SQLModel, table=True):
         软件工程 3 班」，一行放不下，窄屏更是一团。「信工软工 3 班」
         一眼能读完。
         """
-        if not self.class_no:
+        if self.is_external or not self.class_no:
             return None
 
         from .academic import short_college, short_major

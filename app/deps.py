@@ -86,6 +86,25 @@ def get_optional_user(
     return user
 
 
+def require_campus_member(user: User = Depends(get_current_user)) -> User:
+    """仅限校内成员（member/admin/root）；校外访客返回 403。"""
+    if not user.is_campus_member:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="该功能仅对校内成员开放",
+        )
+    return user
+
+
+def get_optional_campus_member(
+    user: User | None = Depends(get_optional_user),
+) -> User | None:
+    """若当前用户是已登录校内成员则返回，否则返回 None（未登录或校外访客）。"""
+    if user is None or not user.is_campus_member:
+        return None
+    return user
+
+
 def require_admin(user: User = Depends(get_current_user)) -> User:
     """Any administrative role (root or admin)."""
     if user.role not in Role.ADMINISTRATIVE:

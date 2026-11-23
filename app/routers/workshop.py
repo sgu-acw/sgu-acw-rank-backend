@@ -16,7 +16,7 @@ from pydantic import AwareDatetime, BaseModel, Field
 from sqlalchemy import update
 from sqlmodel import Session, select
 
-from ..deps import get_session, require_admin, require_origin_secret
+from ..deps import get_session, require_admin, require_campus_member, require_origin_secret
 from ..models import User, WorkshopStatusOverride
 
 router = APIRouter(tags=["workshop"], dependencies=[Depends(require_origin_secret)])
@@ -76,14 +76,20 @@ def _out(row: WorkshopStatusOverride) -> OverrideOut:
 
 
 @router.get("/workshop/override", response_model=OverrideOut | None)
-def get_override(session: Session = Depends(get_session)) -> OverrideOut | None:
+def get_override(
+    _user: User = Depends(require_campus_member),
+    session: Session = Depends(get_session),
+) -> OverrideOut | None:
     row = _current(session)
     return _out(row) if row else None
 
 
 @router.get("/workshop/schedule", response_model=list[OverrideOut])
-def get_schedule(session: Session = Depends(get_session)) -> list[OverrideOut]:
-    """当前生效 + 未来 30 天内排期的状态，公开可读。"""
+def get_schedule(
+    _user: User = Depends(require_campus_member),
+    session: Session = Depends(get_session),
+) -> list[OverrideOut]:
+    """当前生效 + 未来 30 天内排期的状态，仅校内成员可读。"""
     now = datetime.now(UTC)
     horizon = now + timedelta(days=30)
     rows = [

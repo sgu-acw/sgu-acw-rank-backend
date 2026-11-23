@@ -160,7 +160,7 @@ def test_classroom_workflow_and_two_session_finalization(local_client):
         running = clients[0].get(f"/api/camps/{camp_id}").json()
         assert running["registration_count"] == 2
         assert [r["solved_count"] for r in running["leaderboard"]] == [2, 0]
-        assert guest.get(f"/api/camps/{camp_id}").json()["problems"] == []
+        assert guest.get(f"/api/camps/{camp_id}").status_code == 401
         # 推进到最后一条正常提交的截止边界，再提交的记录保留在练习进度中。
         with Session(get_engine()) as db:
             actual = db.get(Camp, camp_id)
@@ -169,9 +169,13 @@ def test_classroom_workflow_and_two_session_finalization(local_client):
             db.commit()
         late = receipt(published[0], ids[1])
         assert clients[1].post("/api/learning/runs", json=late).status_code == 200
-        public = guest.get(f"/api/camps/{camp_id}").json()
-        assert public["phase"] == "finalizing" and len(public["problems"]) == 2
-        assert public["leaderboard"] == [] and all(not p["done"] for p in public["problems"])
+        assert guest.get(f"/api/camps/{camp_id}").status_code == 401
+        unregistered_campus = c.get(f"/api/camps/{camp_id}").json()
+        assert unregistered_campus["phase"] == "finalizing"
+        assert len(unregistered_campus["problems"]) == 2
+        assert unregistered_campus["leaderboard"] == [] and all(
+            not p["done"] for p in unregistered_campus["problems"]
+        )
         barrier = Barrier(2)
 
         def finalize(_):

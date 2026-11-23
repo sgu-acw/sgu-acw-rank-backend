@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlmodel import Session, delete, select
 
 from ..db import get_session
-from ..deps import get_optional_user, require_admin, require_origin_secret
+from ..deps import get_optional_user, require_admin, require_campus_member, require_origin_secret
 from ..models import (
     Platform,
     ProblemCache,
@@ -105,14 +105,10 @@ def list_lists(
 @router.get("/{list_id}/rank", response_model=ProblemListRank)
 def list_completion_rank(
     list_id: int,
-    _viewer: User | None = Depends(get_optional_user),
+    _viewer: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> ProblemListRank:
-    """题单完成度排行榜。
-
-    公开可看：谁做了多少不是隐私——练习量榜本来就是公开的。未登录也能看，
-    只是不能看自己那一行的高亮（前端处理）。
-    """
+    """题单完成度排行榜，仅对校内成员开放。"""
     problem_list = db.get(ProblemList, list_id)
     if problem_list is None:
         raise HTTPException(status_code=404, detail="题单不存在")

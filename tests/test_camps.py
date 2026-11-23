@@ -281,26 +281,25 @@ def test_admin_adds_and_removes_problem(root_client, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_list_all_camps(client, db):
-    """未登录也能看集训列表。"""
+def test_list_all_camps(client, member_client, db):
+    """集训列表仅对校内成员开放，未登录返回 401。"""
     make_camp(db, name="集训一")
     make_camp(db, name="集训二")
 
-    rows = client.get("/api/camps").json()
+    assert client.get("/api/camps").status_code == 401
+    rows = member_client.get("/api/camps").json()
     names = {r["name"] for r in rows}
     assert names == {"集训一", "集训二"}
 
 
 def test_detail_hides_problems_until_registered(client, member_client, db):
-    """未报名看不到题目和排行榜；未登录也一样。"""
+    """未登录返回 401；校内成员未报名看不到题目和排行榜。"""
     camp = make_camp(db)
     add_problem(db, camp, key="1A")
     uid = user_id_of(db, MEMBER_STUDENT_ID)
     make_account(db, uid, "codeforces", "cf_user", solved=["1A"])
 
-    anonymous = client.get(f"/api/camps/{camp.id}").json()
-    assert anonymous["problems"] == []
-    assert anonymous["leaderboard"] == []
+    assert client.get(f"/api/camps/{camp.id}").status_code == 401
 
     outsider = member_client.get(f"/api/camps/{camp.id}").json()
     assert outsider["registered"] is False

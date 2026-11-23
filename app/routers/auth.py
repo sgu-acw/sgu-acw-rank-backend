@@ -16,14 +16,16 @@ import qrcode.image.svg
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from ..config import get_settings
 from ..db import get_session
 from ..deps import get_current_session, get_current_user, get_optional_user, require_origin_secret
-from ..models import Invite, InviteUse, LoginTicket, User, UserSession, UserStatus, utcnow
+from ..models import Invite, InviteUse, LoginTicket, Role, User, UserSession, UserStatus, utcnow
 from ..schemas import (
     ChangePasswordRequest,
+    ExternalRegisterRequest,
     LoginRequest,
     RegisterRequest,
     SessionEntry,
@@ -38,7 +40,12 @@ from ..security import (
     verify_login_ticket,
     verify_password,
 )
-from ..student_id import StudentIdError, parse_student_id
+from ..student_id import (
+    StudentIdError,
+    normalize_login_identifier,
+    parse_external_username,
+    parse_student_id,
+)
 
 router = APIRouter(
     prefix="/auth",
@@ -60,11 +67,47 @@ _login_failures_account: dict[tuple[str, str], deque[float]] = {}
 _login_failures_ip: dict[str, deque[float]] = {}
 
 
+#: 校外自助注册滑动窗口防刷：单 IP 每小时最多创建 5 个校外账号。
+EXTERNAL_REGISTER_WINDOW_SECONDS = 3600
+EXTERNAL_REGISTER_MAX_PER_IP = 5
+_external_register_ip: dict[str, deque[float]] = {}
+
+
 def reset_login_rate_limits() -> None:
-    """清空登录失败计数，仅供测试使用。"""
+    """清空登录与注册频率计数，仅供测试使用。"""
     with _login_rate_lock:
         _login_failures_account.clear()
         _login_failures_ip.clear()
+        _external_register_ip.clear()
+
+
+def _prune_external_register(bucket: deque[float], now: float) -> None:
+    cutoff = now - EXTERNAL_REGISTER_WINDOW_SECONDS
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+
+
+def _check_external_register_rate_limit(ip: str) -> None:
+    now = time.monotonic()
+    with _login_rate_lock:
+        bucket = _external_register_ip.get(ip)
+        if bucket:
+            _prune_external_register(bucket, now)
+            if len(bucket) >= EXTERNAL_REGISTER_MAX_PER_IP:
+                wait = max(1, int(EXTERNAL_REGISTER_WINDOW_SECONDS - (now - bucket[0])) + 1)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"注册过于频繁，请 {wait} 秒后再试",
+                    headers={"Retry-After": str(wait)},
+                )
+
+
+def _record_external_register(ip: str) -> None:
+    now = time.monotonic()
+    with _login_rate_lock:
+        bucket = _external_register_ip.setdefault(ip, deque())
+        _prune_external_register(bucket, now)
+        bucket.append(now)
 
 
 def _client_ip(request: Request) -> str:
@@ -279,6 +322,62 @@ def register(
     return user
 
 
+@router.post("/register-external", response_model=UserSelf, status_code=status.HTTP_201_CREATED)
+def register_external(
+    payload: ExternalRegisterRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_session),
+) -> User:
+    """校外人员自助注册通道。
+
+    无需邀请码与校内学号，使用自定义用户名（字母开头，3–16 位）创建
+    ``external`` 账号。该角色只开放题库练习、每日一题、题单浏览、博客与
+    荣誉殿堂等必要公开功能，无法查看校内成员名录、榜单、集训与报名信息。
+    """
+    ip = _client_ip(request)
+    _check_external_register_rate_limit(ip)
+
+    try:
+        username = parse_external_username(payload.username)
+    except StudentIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    existing = db.exec(select(User).where(User.student_id == username)).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="该用户名已被注册")
+
+    user = User(
+        student_id=username,
+        password_hash=hash_password(payload.password),
+        display_name=payload.display_name,
+        enroll_year=0,
+        level=0,
+        college_code="",
+        major_code="",
+        class_no=0,
+        role=Role.EXTERNAL,
+        status=UserStatus.ACTIVE,
+        created_at=utcnow(),
+    )
+    try:
+        db.add(user)
+        db.flush()
+        token = _issue_session(db, user, request)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="该用户名已被注册") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    _record_external_register(ip)
+    db.refresh(user)
+    _set_session_cookie(response, token)
+    return user
+
+
 def _auth_fingerprint(user: User) -> str:
     return hashlib.sha256(f"{user.password_hash}:{user.totp_secret}".encode()).hexdigest()
 
@@ -295,21 +394,21 @@ def login(
     response: Response,
     db: Session = Depends(get_session),
 ) -> dict:
-    student_id = payload.student_id.strip().upper()
+    student_id = normalize_login_identifier(payload.student_id)
     ip = _client_ip(request)
     _check_login_rate_limit(ip, student_id)
     user = db.exec(select(User).where(User.student_id == student_id)).first()
 
-    # Same message either way, so the response does not reveal which student ids
+    # Same message either way, so the response does not reveal which accounts
     # exist. verify_password still runs against a dummy hash when the user is
     # missing, keeping the timing comparable.
     if user is None:
         verify_password(payload.password, _DUMMY_HASH)
         _record_login_failure(ip, student_id)
-        raise HTTPException(status_code=401, detail="学号或密码错误")
+        raise HTTPException(status_code=401, detail="账号或密码错误")
     if not verify_password(payload.password, user.password_hash):
         _record_login_failure(ip, student_id)
-        raise HTTPException(status_code=401, detail="学号或密码错误")
+        raise HTTPException(status_code=401, detail="账号或密码错误")
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="账号已停用")
 

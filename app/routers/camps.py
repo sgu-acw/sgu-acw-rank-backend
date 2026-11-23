@@ -17,10 +17,9 @@ from sqlmodel import Session, func, select
 from .. import camps as camps_mod
 from ..db import get_engine
 from ..deps import (
-    get_current_user,
-    get_optional_user,
     get_session,
     require_admin,
+    require_campus_member,
     require_origin_secret,
 )
 from ..models import (
@@ -213,8 +212,11 @@ def _to_detail(data: dict) -> CampDetail:
 
 
 @router.get("/camps", response_model=list[CampSummary])
-def list_camps(session: Session = Depends(get_session)) -> list[CampSummary]:
-    """所有集训，进行中的在前；还没到显示时间的不出来。"""
+def list_camps(
+    session: Session = Depends(get_session),
+    _user: User = Depends(require_campus_member),
+) -> list[CampSummary]:
+    """所有集训，进行中的在前；还没到显示时间的不出来。仅校内成员可见。"""
     now = datetime.now(UTC)
     rows = [
         c
@@ -228,14 +230,14 @@ def list_camps(session: Session = Depends(get_session)) -> list[CampSummary]:
 def get_camp(
     camp_id: int,
     session: Session = Depends(get_session),
-    user: User | None = Depends(get_optional_user),
+    user: User = Depends(require_campus_member),
 ) -> CampDetail:
     camp = session.get(Camp, camp_id)
     if camp is None:
         raise HTTPException(status_code=404, detail="没有这份集训")
     # 还没到显示时间的集训等同不存在——管理员可以在管理页看。
     visible = camps_mod.visible_from(camp)
-    is_admin = user is not None and user.role in Role.ADMINISTRATIVE
+    is_admin = user.role in Role.ADMINISTRATIVE
     if visible is not None and datetime.now(UTC) < visible and not is_admin:
         raise HTTPException(status_code=404, detail="没有这份集训")
     data = camps_mod.detail_for_user(session, camp, user)
@@ -246,7 +248,7 @@ def get_camp(
 def register(
     camp_id: int,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
 ) -> dict:
     camp = session.get(Camp, camp_id)
     if camp is None:
@@ -262,7 +264,7 @@ def register(
 def unregister(
     camp_id: int,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
 ) -> dict:
     camp = session.get(Camp, camp_id)
     if camp is None:

@@ -11,8 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from ..db import get_session
-from ..deps import get_current_user, require_origin_secret
-from ..models import User, UserStatus
+from ..deps import require_campus_member, require_origin_secret
+from ..models import Role, User, UserStatus
 from ..schemas import UserPublic
 
 router = APIRouter(
@@ -24,16 +24,17 @@ router = APIRouter(
 
 @router.get("", response_model=list[UserPublic])
 def list_members(
-    _current: User = Depends(get_current_user),
+    _current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
     include_disabled: bool = Query(default=False),
 ) -> list[User]:
-    """List members, newest enrolment first.
+    """List campus members, newest enrolment first.
 
     Disabled accounts are hidden unless explicitly asked for, and only an
-    administrator may ask.
+    administrator may ask. External accounts are never included in the campus
+    member directory.
     """
-    statement = select(User)
+    statement = select(User).where(User.role != Role.EXTERNAL)
     if not include_disabled or not _current.is_admin:
         statement = statement.where(User.status == UserStatus.ACTIVE)
     statement = statement.order_by(User.enroll_year.desc(), User.student_id)  # type: ignore[attr-defined]
@@ -43,10 +44,10 @@ def list_members(
 @router.get("/{user_id}", response_model=UserPublic)
 def get_member(
     user_id: int,
-    _current: User = Depends(get_current_user),
+    _current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> User:
     user = db.get(User, user_id)
-    if user is None:
+    if user is None or user.is_external:
         raise HTTPException(status_code=404, detail="成员不存在")
     return user

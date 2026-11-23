@@ -21,12 +21,13 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, select
 
 from ..db import get_session
-from ..deps import get_current_user, require_origin_secret
+from ..deps import require_campus_member, require_origin_secret
 from ..models import (
     Account,
     DailyProgress,
     Platform,
     RefreshQuota,
+    Role,
     SyncRun,
     User,
     UserStatus,
@@ -117,7 +118,12 @@ def build_practice_rank(
     # 必须在下面的早返回之前算，否则空窗口会连带把选项也清空。
     bound_user_ids = select(Account.user_id).where(Account.verified_at.is_not(None))  # type: ignore[union-attr]
     option_users = list(
-        db.exec(select(User).where(User.id.in_(bound_user_ids))).all()  # type: ignore[attr-defined]
+        db.exec(
+            select(User).where(
+                User.id.in_(bound_user_ids),  # type: ignore[attr-defined]
+                User.role != Role.EXTERNAL,
+            )
+        ).all()
     )
     options = PracticeFilterOptions(
         colleges=sorted({u.college_name for u in option_users if u.college_name}),
@@ -161,7 +167,7 @@ def build_practice_rank(
         if account is None:
             continue
         user = users.get(account.user_id)
-        if user is None:
+        if user is None or user.is_external:
             continue
         if not include_retired and user.status != UserStatus.ACTIVE:
             continue
@@ -223,7 +229,7 @@ def build_practice_rank(
 
 @router.get("/rank", response_model=DailyPracticeResponse)
 def practice_rank(
-    _current: User = Depends(get_current_user),
+    _current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
     days: int = Query(default=7, ge=0, le=3650, description="统计最近多少天；0 表示历史综合"),
     platform: str | None = Query(default=None, description="只统计某个平台"),
@@ -249,7 +255,7 @@ def practice_rank(
 
 @router.get("/status", response_model=SyncStatus)
 def sync_status(
-    _current: User = Depends(get_current_user),
+    _current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> SyncStatus:
     """上一次同步的情况，用于在页面上提示数据新旧。"""
@@ -291,7 +297,7 @@ def _current_week_start() -> str:
 
 @router.get("/quota")
 def refresh_quota(
-    current: User = Depends(get_current_user),
+    current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> dict:
     """本周还剩几次手动刷新机会。"""
@@ -313,7 +319,7 @@ def refresh_quota(
 
 @router.post("/refresh")
 def manual_refresh(
-    current: User = Depends(get_current_user),
+    current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> dict:
     """立刻抓一次自己绑定的账号，不等定时任务。
@@ -403,7 +409,7 @@ def manual_refresh(
 
 @router.get("/rating", response_model=RatingResponse)
 def rating_board(
-    _current: User = Depends(get_current_user),
+    _current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
     platform: str = Query(default=Platform.CODEFORCES),
     include_retired: bool = Query(default=False),
@@ -437,7 +443,7 @@ def rating_board(
     entries: list[RatingEntry] = []
     for account in accounts:
         user = users.get(account.user_id)
-        if user is None:
+        if user is None or user.is_external:
             continue
         if not include_retired and user.status != UserStatus.ACTIVE:
             continue
@@ -492,7 +498,7 @@ def rating_board(
 
 @router.get("/dashboard", response_model=DashboardSummary)
 def dashboard(
-    current: User = Depends(get_current_user),
+    current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> DashboardSummary:
     """首页用的个人数据面板。

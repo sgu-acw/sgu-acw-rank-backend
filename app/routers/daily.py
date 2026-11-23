@@ -12,7 +12,12 @@ from sqlmodel import Session, select
 from .. import daily
 from ..daily import CHINA_TZ, solved_by_count
 from ..db import get_session
-from ..deps import get_optional_user, require_admin, require_origin_secret
+from ..deps import (
+    get_optional_campus_member,
+    require_admin,
+    require_campus_member,
+    require_origin_secret,
+)
 from ..models import DailyProblem, DailyProblemSolve, ProblemCache, User
 from ..problemlists import solved_keys
 from ..problems import problem_url
@@ -73,6 +78,7 @@ def _to_entries(
     rows: list[DailyProblem],
     *,
     solved: set[tuple[str, str]] | None,
+    include_campus_stats: bool = True,
 ) -> list[DailyProblemEntry]:
     """把落库的记录补上题目元信息。
 
@@ -80,7 +86,7 @@ def _to_entries(
     已经是权威来源，存两份迟早会不一致。
     """
     cache = _cached_map(session, rows)
-    members = solved_by_count(session, rows)
+    members = solved_by_count(session, rows) if include_campus_stats else {}
     out: list[DailyProblemEntry] = []
     for row in rows:
         cached = cache.get(row.key)
@@ -146,13 +152,14 @@ def _checked_in_names(session: Session, day: str) -> list[str]:
 
 def _board(session: Session, day: str, user: User | None) -> DailyProblemBoard:
     rows = daily.ensure_daily(session, day=day)
-    solved = solved_keys(session, user.id) if user and user.id else None
+    is_campus = user is not None and user.is_campus_member
+    solved = solved_keys(session, user.id) if is_campus and user.id else None
     return DailyProblemBoard(
         day=day,
         reset_at=daily.next_reset_at(),
-        problems=_to_entries(session, rows, solved=solved),
-        checked_in_today_names=_checked_in_names(session, day),
-        **_checkin_stats(session, user, day),
+        problems=_to_entries(session, rows, solved=solved, include_campus_stats=is_campus),
+        checked_in_today_names=_checked_in_names(session, day) if is_campus else [],
+        **_checkin_stats(session, user if is_campus else None, day),
     )
 
 
@@ -170,12 +177,13 @@ def _validate_day(day: str) -> str:
 def get_daily(
     day: str | None = Query(default=None, description="YYYY-MM-DD，默认今天"),
     session: Session = Depends(get_session),
-    user: User | None = Depends(get_optional_user),
+    user: User | None = Depends(get_optional_campus_member),
 ) -> DailyProblemBoard:
     """某一天的每日一题，默认今天。
 
     第一次访问某一天时现抽并落库，之后读缓存。所以这个接口是幂等的：
     同一天无论调多少次，返回的都是同一套题。
+    未登录和校外用户仅可查看题目，不返回校内成员签到名单与过题人数。
     """
     target = _validate_day(day) if day else daily.workshop_today()
     return _board(session, target, user)
@@ -189,7 +197,7 @@ def get_daily(
 def redraw_daily(
     day: str | None = Query(default=None, description="要重抽的日期，默认今天"),
     session: Session = Depends(get_session),
-    user: User | None = Depends(get_optional_user),
+    user: User | None = Depends(get_optional_campus_member),
 ) -> DailyProblemBoard:
     """重抽某一天。管理员用。
 
@@ -269,13 +277,10 @@ class DailySolversBoard(BaseModel):
 @router.get("/daily/solvers", response_model=DailySolversBoard)
 def get_daily_solvers(
     day: str | None = Query(default=None, description="YYYY-MM-DD，默认今天"),
+    _current: User = Depends(require_campus_member),
     session: Session = Depends(get_session),
 ) -> DailySolversBoard:
-    """当天每道题谁通过了，按记录时间从早到晚。
-
-    和签到榜的区别：签到榜是「谁连续来了几天」，这个是「哪道题谁先做出来」。
-    一道题没人通过就不出现在列表里。
-    """
+    """当天每道题谁通过了，按记录时间从早到晚。仅对校内成员开放。"""
     target = _validate_day(day) if day else daily.workshop_today()
     problems = daily.daily_for_day(session, target)
     if not problems:
@@ -288,6 +293,7 @@ def get_daily_solvers(
     users = {
         user.id: user
         for user in session.exec(select(User).where(User.id.in_(user_ids))).all()  # type: ignore[attr-defined]
+        if user.is_campus_member
     } if user_ids else {}
 
     # 题目元信息也一次查完。
@@ -340,9 +346,10 @@ def get_daily_solvers(
 @router.get("/daily/checkin", response_model=CheckinBoard)
 def get_checkin_board(
     limit: int = Query(default=50, ge=1, le=200),
+    _current: User = Depends(require_campus_member),
     session: Session = Depends(get_session),
 ) -> CheckinBoard:
-    """签到天数排行榜。
+    """签到天数排行榜。仅对校内成员开放。
 
     只列签过到的人。一次没签过的人不占榜位——那更接近「没参加」，
     而不是「0 天」。
@@ -355,6 +362,7 @@ def get_checkin_board(
     users = {
         user.id: user
         for user in session.exec(select(User).where(User.id.in_(user_ids))).all()  # type: ignore[attr-defined]
+        if user.is_campus_member
     }
 
     entries: list[CheckinEntry] = []

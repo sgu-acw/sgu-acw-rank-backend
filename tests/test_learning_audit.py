@@ -117,7 +117,7 @@ def test_learning_deadline_finalization_and_done_marks_are_consistent(local_clie
     assert outsider["registered"] is False and outsider["leaderboard"] == []
     assert all(not p["done"] for p in outsider["problems"])
     c.cookies.clear()
-    assert all(not p["done"] for p in c.get(f"/api/camps/{camp_id}").json()["problems"])
+    assert c.get(f"/api/camps/{camp_id}").status_code == 401
 
 
 def test_learning_allows_registration_in_a_mixed_camp_without_external_accounts(local_client):

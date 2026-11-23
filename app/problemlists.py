@@ -392,13 +392,13 @@ def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListR
     if total == 0:
         return []
 
-    # 有绑定账号的成员。root 不算——它不是成员。
+    # 有绑定账号的校内成员。root 和校外账号不计入。
     bound_ids = select(Account.user_id).where(Account.verified_at.is_not(None))  # type: ignore[union-attr]
     members = list(
         db.exec(
             select(User).where(
                 User.id.in_(bound_ids),  # type: ignore[attr-defined]
-                User.role != Role.ROOT,
+                User.role.in_((Role.ADMIN, Role.MEMBER)),  # type: ignore[attr-defined]
                 User.status == UserStatus.ACTIVE,
             )
         ).all()

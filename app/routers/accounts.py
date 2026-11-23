@@ -26,7 +26,7 @@ from sqlmodel import Session, select
 from ..cleanup import delete_account_data
 from ..config import get_settings
 from ..db import get_session
-from ..deps import get_current_user, require_origin_secret
+from ..deps import require_campus_member, require_origin_secret
 from ..models import Account, Platform, User, utcnow
 from ..platforms import FetchError, check_signature, fetch_profile
 from ..schemas import (
@@ -57,7 +57,7 @@ def _own_account(db: Session, user: User, account_id: int) -> Account:
 
 @router.get("", response_model=list[AccountPublic])
 def list_my_accounts(
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> list[Account]:
     statement = (
@@ -71,7 +71,7 @@ def list_my_accounts(
 @router.post("", response_model=AccountPublic, status_code=status.HTTP_201_CREATED)
 def add_account(
     payload: AccountCreate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> Account:
     """声明一个平台账号，并返回待填入的验证码。
@@ -141,7 +141,7 @@ def add_account(
 @router.post("/{account_id}/verify", response_model=AccountVerifyResult)
 def verify_account(
     account_id: int,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> AccountVerifyResult:
     """读平台签名，确认验证码在里面。
@@ -235,7 +235,7 @@ def verify_account(
 @router.post("/{account_id}/renew", response_model=AccountPublic)
 def renew_token(
     account_id: int,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> Account:
     """换一个新的验证码。用于码过期或填错后重来。"""
@@ -254,7 +254,7 @@ def renew_token(
 @router.delete("/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_account(
     account_id: int,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> None:
     """解绑账号。
@@ -278,7 +278,7 @@ def remove_account(
 @router.get("/of/{user_id}", response_model=list[AccountPublic])
 def accounts_of(
     user_id: int,
-    _current: User = Depends(get_current_user),
+    _current: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> list[Account]:
     """看某个成员的账号。只返回已验证的，未验证的属于半成品状态。

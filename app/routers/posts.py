@@ -203,8 +203,8 @@ def get_post(slug: str, session: Session = Depends(get_session)) -> PostDetail:
 
 
 def _require_author(user: User = Depends(get_current_user)) -> User:
-    """能写文章的人：管理员，或者被勾了「可发文章」的成员。"""
-    if user.is_admin or user.can_post:
+    """能写文章的人：管理员，或者被勾了「可发文章」的校内成员。"""
+    if user.is_campus_member and (user.is_admin or user.can_post):
         return user
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="没有发文权限")
 

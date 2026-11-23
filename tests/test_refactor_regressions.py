@@ -139,7 +139,10 @@ def test_origin_secret_enforced_across_all_api_routers(tmp_path, monkeypatch):
         # 携带正确来源密钥后，公开接口放行、鉴权接口返回 401（非 403 origin 错误）
         authed_edge = TestClient(app, headers={"X-Origin-Secret": "top-secret-edge-token"})
         assert authed_edge.get("/api/posts").status_code == 200
-        assert authed_edge.get("/api/workshop/override").status_code == 200
+        assert authed_edge.get("/api/daily").status_code == 200
+        assert authed_edge.get("/api/workshop/override").status_code == 401
+        assert authed_edge.get("/api/camps").status_code == 401
+        assert authed_edge.get("/api/signups").status_code == 401
         assert authed_edge.get("/api/admin/stats").status_code == 401
         assert authed_edge.get("/api/admin/notifications").status_code == 401
     finally:

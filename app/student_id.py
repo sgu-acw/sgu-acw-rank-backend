@@ -63,6 +63,10 @@ LINKED_COLLEGE_CODES: frozenset[str] = frozenset({"94", "95", "96", "97"})
 
 _ID_RE = re.compile(r"^(\d{2})(\d)(\d{2})(\d{2})(\d)(\d{3})([A-Z])?$")
 
+#: 校外访客用户名规则：以英文字母开头，3-16 位，仅含小写字母、数字、下划线和短横线。
+#: 所有校内学号与 root 占位号均以数字开头，两者天然互斥、永不冲突。
+_EXTERNAL_USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,15}$")
+
 
 #: root 账号的学号。十一个 0 不是合法学号——学院码 00 不在集合里，所以别人
 #: 注册不到这个号。root 不走学号解析，创建时直接填占位值。
@@ -147,3 +151,29 @@ def is_valid_student_id(value: str) -> bool:
     except StudentIdError:
         return False
     return True
+
+
+def parse_external_username(value: str) -> str:
+    """校验并归一化校外人员用户名（全小写）。"""
+    text = (value or "").strip().lower()
+    if not _EXTERNAL_USERNAME_RE.match(text):
+        raise StudentIdError("用户名须为 3–16 位，以英文字母开头，仅限字母、数字、下划线和短横线")
+    return text
+
+
+def is_valid_external_username(value: str) -> bool:
+    try:
+        parse_external_username(value)
+    except StudentIdError:
+        return False
+    return True
+
+
+def normalize_login_identifier(value: str) -> str:
+    """登录账号名归一化：以字母开头视作校外用户名（小写），否则按学号处理（大写）。"""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if text[0].isascii() and text[0].isalpha():
+        return text.lower()
+    return text.upper()

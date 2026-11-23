@@ -15,7 +15,7 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, select
 
 from .. import push as push_mod
-from ..deps import get_current_user, get_session, require_admin, require_origin_secret
+from ..deps import get_session, require_admin, require_campus_member, require_origin_secret
 from ..models import (
     CampRegistration,
     PushDispatch,
@@ -65,7 +65,7 @@ def vapid_key() -> dict:
 def subscribe(
     payload: SubscribeIn,
     request: Request,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> dict:
     # endpoint 是自然唯一键；并发重订阅执行原子 upsert。
@@ -92,7 +92,7 @@ def subscribe(
 @router.post("/push/unsubscribe", status_code=204)
 def unsubscribe(
     payload: UnsubscribeIn,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> None:
     for row in db.exec(
@@ -110,7 +110,12 @@ def _audience_user_ids(db: Session, audience: str) -> list[int]:
     if audience == "all":
         return [
             u.id
-            for u in db.exec(select(User).where(User.status == UserStatus.ACTIVE)).all()
+            for u in db.exec(
+                select(User).where(
+                    User.status == UserStatus.ACTIVE,
+                    User.role != Role.EXTERNAL,
+                )
+            ).all()
             if u.id
         ]
     if audience == "admins":

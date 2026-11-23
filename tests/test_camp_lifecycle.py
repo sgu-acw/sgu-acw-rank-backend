@@ -89,22 +89,23 @@ def test_ended_problem_list_is_public_without_exposing_standings(
         camps.finish_finalizations(db)
     db.commit()
 
-    for viewer in (client, member_client):
-        response = viewer.get(f"/api/camps/{camp.id}")
-        assert response.status_code == 200
-        detail = response.json()
-        assert detail["registered"] is False
-        assert detail["leaderboard"] == []
-        if phase == "running":
-            assert detail["problems"] == []
-        else:
-            assert detail["ended"] is True
-            assert detail["phase"] == ("finalized" if phase == "finalized" else "finalizing")
-            assert [p["key"] for p in detail["problems"]] == ["B2064", "1A"]
-            assert detail["problems"][0]["name"] == "测试题名"
-            assert detail["problems"][0]["url"] == "https://www.luogu.com.cn/problem/B2064"
-            assert all(p["done"] is False for p in detail["problems"])
-            assert detail["can_register"] is False
+    assert client.get(f"/api/camps/{camp.id}").status_code == 401
+
+    response = member_client.get(f"/api/camps/{camp.id}")
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail["registered"] is False
+    assert detail["leaderboard"] == []
+    if phase == "running":
+        assert detail["problems"] == []
+    else:
+        assert detail["ended"] is True
+        assert detail["phase"] == ("finalized" if phase == "finalized" else "finalizing")
+        assert [p["key"] for p in detail["problems"]] == ["B2064", "1A"]
+        assert detail["problems"][0]["name"] == "测试题名"
+        assert detail["problems"][0]["url"] == "https://www.luogu.com.cn/problem/B2064"
+        assert all(p["done"] is False for p in detail["problems"])
+        assert detail["can_register"] is False
 
     # 已报名成员仍能查看原来的成绩和通过标记。
     participant = root_client.get(f"/api/camps/{camp.id}").json()

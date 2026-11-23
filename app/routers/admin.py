@@ -48,7 +48,7 @@ from ..schemas import (
     UserAdmin,
 )
 from ..security import hash_password, new_invite_code, new_temporary_password
-from ..student_id import StudentIdError, parse_student_id
+from ..student_id import StudentIdError, parse_external_username, parse_student_id
 
 router = APIRouter(
     prefix="/admin",
@@ -281,28 +281,50 @@ def create_user(
     if payload.role == Role.ROOT:
         raise HTTPException(status_code=403, detail="不能直接创建 root 账号")
 
-    try:
-        parsed = parse_student_id(payload.student_id)
-    except StudentIdError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.role == Role.EXTERNAL:
+        try:
+            username = parse_external_username(payload.student_id)
+        except StudentIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if db.exec(select(User).where(User.student_id == username)).first() is not None:
+            raise HTTPException(status_code=409, detail="该用户名已注册")
+        user = User(
+            student_id=username,
+            password_hash=hash_password(payload.password),
+            display_name=payload.display_name,
+            enroll_year=0,
+            level=0,
+            college_code="",
+            major_code="",
+            class_no=0,
+            role=Role.EXTERNAL,
+            status=UserStatus.ACTIVE,
+            admin_note=payload.admin_note,
+            created_at=utcnow(),
+        )
+    else:
+        try:
+            parsed = parse_student_id(payload.student_id)
+        except StudentIdError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if db.exec(select(User).where(User.student_id == parsed.raw)).first() is not None:
-        raise HTTPException(status_code=409, detail="该学号已注册")
+        if db.exec(select(User).where(User.student_id == parsed.raw)).first() is not None:
+            raise HTTPException(status_code=409, detail="该学号已注册")
 
-    user = User(
-        student_id=parsed.raw,
-        password_hash=hash_password(payload.password),
-        display_name=payload.display_name,
-        enroll_year=parsed.enroll_year,
-        level=parsed.level,
-        college_code=parsed.college_code,
-        major_code=parsed.major_code,
-        class_no=parsed.class_no,
-        role=payload.role,
-        status=UserStatus.ACTIVE,
-        admin_note=payload.admin_note,
-        created_at=utcnow(),
-    )
+        user = User(
+            student_id=parsed.raw,
+            password_hash=hash_password(payload.password),
+            display_name=payload.display_name,
+            enroll_year=parsed.enroll_year,
+            level=parsed.level,
+            college_code=parsed.college_code,
+            major_code=parsed.major_code,
+            class_no=parsed.class_no,
+            role=payload.role,
+            status=UserStatus.ACTIVE,
+            admin_note=payload.admin_note,
+            created_at=utcnow(),
+        )
     db.add(user)
     try:
         db.commit()
@@ -340,6 +362,8 @@ def update_user(
     if payload.role is not None and payload.role != user.role:
         if user.is_root:
             raise HTTPException(status_code=403, detail="不能修改 root 的角色")
+        if user.is_external or payload.role == Role.EXTERNAL:
+            raise HTTPException(status_code=400, detail="校外账号与校内成员身份不能直接互转")
         if user.id == admin.id and payload.role not in Role.ADMINISTRATIVE:
             raise HTTPException(status_code=400, detail="不能撤销自己的管理员权限")
         if payload.role == Role.ROOT and not admin.is_root:
@@ -365,6 +389,8 @@ def update_user(
         user.display_name = payload.display_name
 
     if payload.can_post is not None:
+        if user.is_external and payload.can_post:
+            raise HTTPException(status_code=400, detail="校外账号不能授予发文章权限")
         user.can_post = payload.can_post
 
     # 空串表示恢复成按学号查表。
@@ -473,6 +499,9 @@ def stats(db: Session = Depends(get_session)) -> dict:
     admins = db.exec(
         select(func.count()).select_from(User).where(User.role.in_(Role.ADMINISTRATIVE))  # type: ignore[attr-defined]
     ).one()
+    externals = db.exec(
+        select(func.count()).select_from(User).where(User.role == Role.EXTERNAL)
+    ).one()
     now = utcnow()
     live_invites = db.exec(
         select(func.count())
@@ -490,6 +519,7 @@ def stats(db: Session = Depends(get_session)) -> dict:
         "user_count": int(total),
         "active_count": int(active),
         "admin_count": int(admins),
+        "external_count": int(externals),
         "usable_invite_count": int(live_invites),
         "push_subscriber_count": int(push_users),
         "push_device_count": int(push_devices),

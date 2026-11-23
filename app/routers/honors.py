@@ -10,7 +10,7 @@ from sqlalchemy import update
 from sqlmodel import Session, select
 
 from ..db import get_session
-from ..deps import get_current_user, require_admin, require_origin_secret
+from ..deps import require_admin, require_campus_member, require_origin_secret
 from ..honor_models import HonorAward, HonorEvent, HonorRecipient
 from ..honors import (
     eligibility,
@@ -20,7 +20,7 @@ from ..honors import (
     study_start,
     user_view,
 )
-from ..models import User
+from ..models import Role, User
 
 router = APIRouter(prefix="/honors", tags=["honors"], dependencies=[Depends(require_origin_secret)])
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
@@ -97,7 +97,7 @@ def lock(db):
 
 
 def award_views(db, *, admin=False, user_id=None):
-    users = {u.id: u for u in db.exec(select(User)).all()}
+    users = {u.id: u for u in db.exec(select(User).where(User.role != Role.EXTERNAL)).all()}
     index = name_index(list(users.values())) if admin else {}
     recipients = {}
     for r in db.exec(select(HonorRecipient).order_by(HonorRecipient.position)).all():
@@ -162,16 +162,21 @@ def public_honors(db: Session = Depends(get_session)):
 
 @router.get("/users/{user_id}")
 def user_honors(
-    user_id: int, _user: User = Depends(get_current_user), db: Session = Depends(get_session)
+    user_id: int, _user: User = Depends(require_campus_member), db: Session = Depends(get_session)
 ):
-    if db.get(User, user_id) is None:
+    target = db.get(User, user_id)
+    if target is None or target.is_external:
         raise HTTPException(404, "成员不存在")
     return award_views(db, user_id=user_id)
 
 
 @router.get("/admin/users", dependencies=[Depends(require_admin)])
 def list_users(db: Session = Depends(get_session)):
-    users = db.exec(select(User).order_by(User.enroll_year.desc(), User.student_id)).all()
+    users = db.exec(
+        select(User)
+        .where(User.role != Role.EXTERNAL)
+        .order_by(User.enroll_year.desc(), User.student_id)
+    ).all()
     return [user_view(u) for u in users]
 
 

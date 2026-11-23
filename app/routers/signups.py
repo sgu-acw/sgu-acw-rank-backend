@@ -32,10 +32,9 @@ from sqlmodel import Session, select
 
 from .. import camps as camps_mod
 from ..deps import (
-    get_current_user,
-    get_optional_user,
     get_session,
     require_admin,
+    require_campus_member,
     require_origin_secret,
 )
 from ..models import Platform, Signup, SignupEntry, User, utcnow
@@ -322,7 +321,7 @@ def _summarize_many(
 @router.get("/signups", response_model=list[SignupSummary])
 def list_signups(
     db: Session = Depends(get_session),
-    user: User | None = Depends(get_optional_user),
+    user: User = Depends(require_campus_member),
 ) -> list[SignupSummary]:
     now = datetime.now(UTC)
     rows = list(db.exec(select(Signup).order_by(Signup.open_at.desc())).all())  # type: ignore[attr-defined]
@@ -333,7 +332,7 @@ def list_signups(
 def get_signup(
     signup_id: int,
     db: Session = Depends(get_session),
-    user: User | None = Depends(get_optional_user),
+    user: User = Depends(require_campus_member),
 ) -> SignupSummary:
     s = db.get(Signup, signup_id)
     if s is None:
@@ -344,7 +343,7 @@ def get_signup(
 @router.get("/signups/{signup_id}/entries/me")
 def my_entry(
     signup_id: int,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> dict:
     entry = db.exec(
@@ -371,7 +370,7 @@ def _lock_signup(db: Session, signup_id: int) -> Signup | None:
 def submit_entry(
     signup_id: int,
     payload: SubmitEntry,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> dict:
     s = _lock_signup(db, signup_id)
@@ -436,7 +435,7 @@ def submit_entry(
 @router.delete("/signups/{signup_id}/entries/me", status_code=204)
 def withdraw_entry(
     signup_id: int,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_campus_member),
     db: Session = Depends(get_session),
 ) -> None:
     s = _lock_signup(db, signup_id)
