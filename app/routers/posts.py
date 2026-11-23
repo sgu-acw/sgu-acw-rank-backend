@@ -8,18 +8,20 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
+from urllib.parse import quote
 from xml.sax.saxutils import escape
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from .. import posts as posts_mod
-from ..deps import get_current_user, get_session, require_admin
+from ..deps import get_current_user, get_session, require_admin, require_origin_secret
 from ..models import Post, User
 
-router = APIRouter(tags=["posts"])
+router = APIRouter(tags=["posts"], dependencies=[Depends(require_origin_secret)])
 
 
 # --------------------------------------------------------------------------- #
@@ -168,7 +170,7 @@ def rss(session: Session = Depends(get_session)) -> Response:
         items.append(
             "<item>"
             f"<title>{escape(p.title)}</title>"
-            f"<link>https://sgu-acw.zh314.xyz/blog/{escape(p.slug)}</link>"
+            f"<link>https://sgu-acw.zh314.xyz/post/{escape(quote(p.slug, safe=''))}</link>"
             f"<guid isPermaLink=\"false\">post-{p.id}-{int(p.updated_at.timestamp())}</guid>"
             f"<pubDate>{p.created_at.strftime('%a, %d %b %Y %H:%M:%S +0000')}</pubDate>"
             f"<description>{escape(_excerpt(p.body))}</description>"
@@ -259,21 +261,28 @@ def admin_create(
     session: Session = Depends(get_session),
     user: User = Depends(_require_author),
 ) -> AdminPostDetail:
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="标题不能为空")
     slug = payload.slug.strip() if payload.slug else ""
-    slug = slug or posts_mod.unique_slug(session, payload.title)
+    slug = slug or posts_mod.unique_slug(session, title)
     # 手动给的 slug 也要唯一
     if session.exec(select(Post).where(Post.slug == slug)).first():
         raise HTTPException(status_code=400, detail="这个 slug 已经被用了")
 
     post = Post(
         slug=slug,
-        title=payload.title,
+        title=title,
         body=payload.body,
         sort_order=payload.sort_order,
         author_id=user.id or 0,
     )
     session.add(post)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=400, detail="这个 slug 已经被用了") from None
     session.refresh(post)
     return AdminPostDetail(**_to_admin(post, user).model_dump(), body=post.body)
 
@@ -292,11 +301,15 @@ def admin_update(
     if post.author_id != user.id and not user.is_admin:
         raise HTTPException(status_code=403, detail="只能改自己写的文章")
 
+    next_title = payload.title.strip() if payload.title is not None else None
+    if next_title is not None and not next_title:
+        raise HTTPException(status_code=422, detail="标题不能为空")
+
     content_changed = (
-        payload.title is not None and payload.title != post.title
+        next_title is not None and next_title != post.title
     ) or (payload.body is not None and payload.body != post.body)
-    if payload.title is not None:
-        post.title = payload.title
+    if next_title is not None:
+        post.title = next_title
     if payload.body is not None:
         post.body = payload.body
     if payload.sort_order is not None:
@@ -337,7 +350,21 @@ def admin_toggle_popup(
     post = session.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="没有这篇文章")
-    posts_mod.set_popup(session, post, on=payload.on, until=payload.until)
+    if payload.on:
+        if not post.published:
+            raise HTTPException(status_code=400, detail="未上架的文章不能设为公告弹窗")
+        if payload.until is not None:
+            until_utc = (
+                payload.until.replace(tzinfo=UTC)
+                if payload.until.tzinfo is None
+                else payload.until.astimezone(UTC)
+            )
+            if until_utc <= datetime.now(UTC):
+                raise HTTPException(status_code=422, detail="公告截止时间必须晚于当前时间")
+    try:
+        posts_mod.set_popup(session, post, on=payload.on, until=payload.until)
+    except posts_mod.PostError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     session.refresh(post)
     author = session.get(User, post.author_id)
     return _to_admin(post, author)

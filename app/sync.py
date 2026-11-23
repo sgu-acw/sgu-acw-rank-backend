@@ -369,6 +369,17 @@ def _save_snapshot(db: Session, account: Account, solved) -> None:
         db.add(snapshot)
 
 
+def _claim_rating_write(db: Session, account: Account, started_at) -> bool:
+    """抓取 rating 后才取得写锁；账号已解绑或已有更新结果时放弃覆盖。"""
+    result = db.exec(
+        update(Account).where(Account.id == account.id).values(identifier=Account.identifier)
+    )
+    if result.rowcount != 1:
+        return False
+    db.refresh(account)
+    return account.rating_fetched_at is None or account.rating_fetched_at <= started_at
+
+
 def sync_rating(db: Session, account: Account, *, force: bool = False) -> tuple[bool, str]:
     """同步账号的 rating。返回 ``(是否成功, 说明)``。
 
@@ -386,6 +397,8 @@ def sync_rating(db: Session, account: Account, *, force: bool = False) -> tuple[
     try:
         profile = fetch_profile(account.platform, account.identifier)
     except FetchError as exc:
+        if not _claim_rating_write(db, account, now):
+            return True, "rating 已更新，忽略旧请求"
         # rating 抓不到不算严重：过题数才是榜单主体。只记下来。
         account.rating_failures += 1
         account.last_error = str(exc)[:500]
@@ -393,6 +406,8 @@ def sync_rating(db: Session, account: Account, *, force: bool = False) -> tuple[
         db.add(account)
         return False, str(exc)
 
+    if not _claim_rating_write(db, account, now):
+        return True, "rating 已更新，忽略旧请求"
     account.rating = profile.rating
     account.max_rating = profile.max_rating
     if profile.display_name:
@@ -439,38 +454,31 @@ def run_sync(*, platforms: list[str] | None = None, force: bool = False) -> dict
     fetched = 0
 
     for account_id in account_ids:
-        # 每个账号一个独立事务。抓取是网络操作，一个账号要 0.3～5 秒；如果
-        # 把整个循环包在一个事务里，写锁会被持有几分钟，期间任何登录、绑定、
-        # 手动刷新都会被卡住（实测能卡 3.5 秒以上）。拆开之后锁只在自己那
-        # 一小段写入期间持有，毫秒级。
-        #
-        # 代价是同步不再是原子的，但这本来就不需要：一个账号失败不该回滚
-        # 别人的结果。
+        # 每个账号的过题同步与 rating 同步各自使用独立事务。抓取是网络操作，
+        # 必须保证写锁只在落库瞬间持有，绝不能在写锁内发起外部 HTTP 请求。
         with session_scope() as db:
             account = db.get(Account, account_id)
             if account is None:
                 continue
 
             success, detail, added = sync_account(db, account, force=force)
-            if detail == "未到同步时间":
-                # 没到点就不算「抓过」，也不记日志。这是绝大多数情况：
-                # 每五分钟唤醒一次，而大多数账号的间隔比这长得多。
+            if detail != "未到同步时间":
+                fetched += 1
+                if success:
+                    ok += 1
+                    total += added
+                    logger.info("synced %s/%s: %s", account.platform, account.identifier, detail)
+                else:
+                    errors.append(f"{account.platform}/{account.identifier}: {detail}")
+                    logger.warning(
+                        "sync failed %s/%s: %s", account.platform, account.identifier, detail
+                    )
+
+        # rating 与过题数分开调度，也在独立事务里执行，提交后才发起下次抓取。
+        with session_scope() as db:
+            account = db.get(Account, account_id)
+            if account is not None:
                 sync_rating(db, account, force=force)
-                continue
-
-            fetched += 1
-            if success:
-                ok += 1
-                total += added
-                logger.info("synced %s/%s: %s", account.platform, account.identifier, detail)
-            else:
-                errors.append(f"{account.platform}/{account.identifier}: {detail}")
-                logger.warning(
-                    "sync failed %s/%s: %s", account.platform, account.identifier, detail
-                )
-
-            # rating 与过题数分开调度，各有各的周期。
-            sync_rating(db, account, force=force)
 
     with session_scope() as db:
         camps.finish_finalizations(db)

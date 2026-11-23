@@ -53,6 +53,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from . import daytime
@@ -309,7 +310,16 @@ def ensure_daily(
         session.add(row)
         created.append(row)
 
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        if force:
+            raise
+        existing = session.exec(
+            select(DailyProblem).where(DailyProblem.day == target)
+        ).all()
+        return sorted_by_band(existing)
     for row in created:
         session.refresh(row)
     return sorted_by_band(created)
@@ -431,12 +441,17 @@ def solved_by_count(db: Session, rows: list[DailyProblem]) -> dict[str, int]:
         return {}
 
     wanted = {(row.platform, row.key) for row in rows}
+    platforms = list({row.platform for row in rows})
     counts = dict.fromkeys((row.key for row in rows), 0)
 
-    # 每个账号一份快照，按人合并。
+    # 每个账号一份快照，按人合并；只统计相关平台的已验证账号。
     snapshots = db.exec(
         select(SolvedSnapshot, Account)
         .join(Account, Account.id == SolvedSnapshot.account_id)  # type: ignore[arg-type]
+        .where(
+            Account.verified_at.is_not(None),  # type: ignore[union-attr]
+            Account.platform.in_(platforms),  # type: ignore[attr-defined]
+        )
     ).all()
 
     per_user: dict[int, set[tuple[str, str]]] = {}

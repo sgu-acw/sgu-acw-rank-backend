@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from datetime import timedelta
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlmodel import Session, select
@@ -11,6 +12,9 @@ from .config import get_settings
 from .db import get_session
 from .models import Role, User, UserSession, UserStatus, utcnow
 from .security import hash_session_token
+
+#: 仅当距离上次记录超过该间隔时才回写 last_seen_at，避免只读请求频繁抢占 SQLite 写锁。
+SESSION_TOUCH_INTERVAL = timedelta(minutes=5)
 
 
 def require_origin_secret(
@@ -45,9 +49,11 @@ def get_current_session(
     if row is None or row.is_expired:
         return None
 
-    row.last_seen_at = utcnow()
-    db.add(row)
-    db.commit()
+    now = utcnow()
+    if row.last_seen_at is None or (now - row.last_seen_at) >= SESSION_TOUCH_INTERVAL:
+        row.last_seen_at = now
+        db.add(row)
+        db.commit()
     return row
 
 

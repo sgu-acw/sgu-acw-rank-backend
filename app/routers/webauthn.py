@@ -16,11 +16,11 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from .. import webauthn_flow
-from ..deps import get_current_user, get_session
+from ..deps import get_current_user, get_session, require_origin_secret
 from ..models import PasskeyCredential, User, UserStatus
 from .auth import _issue_session, _set_session_cookie  # noqa: PLC2701
 
-router = APIRouter(tags=["passkeys"])
+router = APIRouter(tags=["passkeys"], dependencies=[Depends(require_origin_secret)])
 
 
 class PasskeyOut(BaseModel):

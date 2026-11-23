@@ -18,25 +18,35 @@ from __future__ import annotations
 from sqlmodel import Session, select
 
 from .honor_models import HonorPerson, HonorRecipient
+from .learning_models import LearningRun
 from .models import (
     Account,
+    Camp,
     CampRegistration,
+    DailyProblemSolve,
     DailyProgress,
+    Invite,
     InviteUse,
     LoginTicket,
     NotificationRead,
     PasskeyCredential,
+    Post,
+    ProblemList,
     PushDispatch,
     PushSubscription,
     RefreshQuota,
+    Role,
+    Signup,
     SignupEntry,
     SolvedSnapshot,
+    User,
     WebAuthnChallenge,
+    WorkshopStatusOverride,
 )
 
 
 def delete_account_data(db: Session, account_id: int) -> int:
-    """删掉某个账号的练习记录与快照。返回删掉的行数。"""
+    """删掉某个账号的练习记录、快照与每日一题过题引用。返回删掉的行数。"""
     removed = 0
     for row in db.exec(select(DailyProgress).where(DailyProgress.account_id == account_id)).all():
         db.delete(row)
@@ -46,6 +56,12 @@ def delete_account_data(db: Session, account_id: int) -> int:
     ).all():
         db.delete(snapshot)
         removed += 1
+    for solve in db.exec(
+        select(DailyProblemSolve).where(DailyProblemSolve.account_id == account_id)
+    ).all():
+        solve.account_id = None
+        db.add(solve)
+    db.flush()
     return removed
 
 
@@ -55,16 +71,26 @@ def delete_user_accounts(db: Session, user_id: int) -> int:
     for account in accounts:
         delete_account_data(db, account.id)
         db.delete(account)
+    db.flush()
     return len(accounts)
 
 
-def delete_user_references(db: Session, user_id: int) -> None:
-    """删掉指向该成员的其余记录。
+def _fallback_owner_id(db: Session, excluded_user_id: int) -> int | None:
+    root = db.exec(
+        select(User.id).where(User.role == Role.ROOT, User.id != excluded_user_id)
+    ).first()
+    if root is not None:
+        return root
+    other_admin = db.exec(
+        select(User.id).where(User.role == Role.ADMIN, User.id != excluded_user_id)
+    ).first()
+    return other_admin
 
-    ``invite_uses``、``refresh_quotas``、``camp_registrations`` 和
-    ``notification_reads`` 都带外键指向 users，不先清掉的话删用户会被
-    数据库拦下。
-    """
+
+def delete_user_references(
+    db: Session, user_id: int, *, reassign_to_user_id: int | None = None
+) -> None:
+    """清理或转移指向该成员的全部外键记录，避免外键约束拦截删除。"""
     # Keep the original award and source name; remove its user association.
     for recipient in db.exec(select(HonorRecipient).where(HonorRecipient.user_id == user_id)).all():
         recipient.user_id = None
@@ -73,22 +99,50 @@ def delete_user_references(db: Session, user_id: int) -> None:
         person.user_id = None
         person.revision += 1
         db.add(person)
+    for invite in db.exec(select(Invite).where(Invite.created_by == user_id)).all():
+        invite.created_by = None
+        db.add(invite)
+    for plist in db.exec(select(ProblemList).where(ProblemList.created_by == user_id)).all():
+        plist.created_by = None
+        db.add(plist)
+
+    # 非空创建者/作者外键（文章、集训、报名、状态覆盖）转移给操作管理员或 root，保留历史内容。
+    target_owner = (
+        reassign_to_user_id
+        if reassign_to_user_id is not None and reassign_to_user_id != user_id
+        else _fallback_owner_id(db, user_id)
+    )
+    if target_owner is not None:
+        for post in db.exec(select(Post).where(Post.author_id == user_id)).all():
+            post.author_id = target_owner
+            db.add(post)
+        for camp in db.exec(select(Camp).where(Camp.created_by == user_id)).all():
+            camp.created_by = target_owner
+            db.add(camp)
+        for signup in db.exec(select(Signup).where(Signup.created_by == user_id)).all():
+            signup.created_by = target_owner
+            db.add(signup)
+        for override in db.exec(
+            select(WorkshopStatusOverride).where(WorkshopStatusOverride.updated_by == user_id)
+        ).all():
+            override.updated_by = target_owner
+            db.add(override)
+
     db.flush()
     for model in (
+        DailyProblemSolve,
+        LearningRun,
         SignupEntry,
         PasskeyCredential,
         WebAuthnChallenge,
         LoginTicket,
         PushSubscription,
         PushDispatch,
+        InviteUse,
+        RefreshQuota,
+        CampRegistration,
+        NotificationRead,
     ):
         for row in db.exec(select(model).where(model.user_id == user_id)).all():
             db.delete(row)
-    for row in db.exec(select(InviteUse).where(InviteUse.user_id == user_id)).all():
-        db.delete(row)
-    for row in db.exec(select(RefreshQuota).where(RefreshQuota.user_id == user_id)).all():
-        db.delete(row)
-    for row in db.exec(select(CampRegistration).where(CampRegistration.user_id == user_id)).all():
-        db.delete(row)
-    for row in db.exec(select(NotificationRead).where(NotificationRead.user_id == user_id)).all():
-        db.delete(row)
+    db.flush()

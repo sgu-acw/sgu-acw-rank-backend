@@ -26,11 +26,16 @@ from sqlmodel import Session, select
 from .. import daily as daily_mod
 from .. import editorials
 from ..db import get_session
-from ..deps import get_optional_user, require_admin, require_editorial_secret
+from ..deps import (
+    get_optional_user,
+    require_admin,
+    require_editorial_secret,
+    require_origin_secret,
+)
 from ..models import DailyProblem, Editorial, EditorialStatus, ProblemCache, User
 from ..problems import problem_url
 
-router = APIRouter(tags=["editorials"])
+router = APIRouter(tags=["editorials"], dependencies=[Depends(require_origin_secret)])
 
 
 # --------------------------------------------------------------------------- #
@@ -379,11 +384,17 @@ def publish_now(editorial_id: int, session: Session = Depends(get_session)) -> d
     row = session.get(Editorial, editorial_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有这篇题解")
+    if row.status in (EditorialStatus.FAILED, EditorialStatus.PENDING) or not row.body.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="题解尚未生成或正文为空，不能公布"
+        )
+    now = datetime.now(UTC)
     if row.published_at is None:
-        row.published_at = datetime.now(UTC)
-        row.updated_at = datetime.now(UTC)
-        session.add(row)
-        session.commit()
+        row.published_at = now
+    row.status = EditorialStatus.PUBLISHED
+    row.updated_at = now
+    session.add(row)
+    session.commit()
     return {"ok": True, "id": editorial_id, "published_at": row.published_at}
 
 

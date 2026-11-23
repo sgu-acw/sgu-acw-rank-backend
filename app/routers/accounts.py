@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -96,6 +97,8 @@ def add_account(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # 唯一约束是 (platform, identifier)：同一平台同一账号只能属于一个人。
+    # 若旧记录未验证且验证码已过期，视为放弃认领，允许新成员接管。
+    now = utcnow()
     existing = db.exec(
         select(Account).where(
             Account.platform == payload.platform,
@@ -105,15 +108,24 @@ def add_account(
     if existing is not None:
         if existing.user_id == user.id:
             raise HTTPException(status_code=409, detail="你已经绑过这个账号了")
-        raise HTTPException(status_code=409, detail="这个账号已被其他成员绑定")
+        expired_unverified = (
+            existing.verified_at is None
+            and existing.verify_expires_at is not None
+            and existing.verify_expires_at <= now
+        )
+        if not expired_unverified:
+            raise HTTPException(status_code=409, detail="这个账号已被其他成员绑定")
+        delete_account_data(db, existing.id)
+        db.delete(existing)
+        db.flush()
 
     account = Account(
         user_id=user.id,
         platform=payload.platform,
         identifier=profile.identifier,
         verify_token=new_verify_token(),
-        verify_expires_at=utcnow() + timedelta(hours=VERIFY_TTL_HOURS),
-        created_at=utcnow(),
+        verify_expires_at=now + timedelta(hours=VERIFY_TTL_HOURS),
+        created_at=now,
     )
     db.add(account)
     try:
@@ -134,25 +146,37 @@ def verify_account(
 ) -> AccountVerifyResult:
     """读平台签名，确认验证码在里面。
 
-    带防抖：同一个账号在 ``verify_cooldown_seconds`` 内只能验一次。每次验证
-    都要去平台读一次资料，连点不仅浪费请求，还可能把平台的 WAF 惹毛——
-    那会连带影响所有人的抓取。前端禁用按钮挡不住直接调接口的。
+    带防抖：同一个账号在 ``verify_cooldown_seconds`` 内只能验一次。先通过
+    SQLite 写锁串行化冷却判断并提交，释放锁之后再发起外部平台请求，既防止
+    并发绕过冷却，又不把数据库锁拖到外部网络调用期间。
     """
-    account = _own_account(db, user, account_id)
+    # 先用条件更新获取 SQLite 写锁再重读状态，串行化同一账号的并发验证。
+    locked = db.exec(
+        update(Account)
+        .where(Account.id == account_id, Account.user_id == user.id)
+        .values(identifier=Account.identifier)
+    )
+    if locked.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="账号不存在")
+    account = db.get(Account, account_id, populate_existing=True)
+    if account is None or account.user_id != user.id:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="账号不存在")
 
     if account.verified_at is not None:
+        db.rollback()
         return AccountVerifyResult(ok=True, detail="这个账号已经验证过了", account=account)
 
     if not account.verify_token:
+        db.rollback()
         raise HTTPException(status_code=400, detail="请先重新生成验证码")
-    if account.verify_expires_at and utcnow() >= account.verify_expires_at:
+    now = utcnow()
+    if account.verify_expires_at and now >= account.verify_expires_at:
+        db.rollback()
         raise HTTPException(status_code=400, detail="验证码已过期，请重新生成")
 
-    # 防抖。冷却时间随尝试次数翻倍，所以连点会被逐步拖慢，而不是永远十秒
-    # 一次。先扣冷却再发请求，这样即使后面网络出错也不会留下可以立即重试
-    # 的空档。
     settings = get_settings()
-    now = utcnow()
     if account.verify_attempted_at is not None:
         cooldown = account.verify_cooldown(
             base=settings.verify_cooldown_seconds,
@@ -160,6 +184,7 @@ def verify_account(
         )
         elapsed = (now - account.verify_attempted_at).total_seconds()
         if elapsed < cooldown:
+            db.rollback()
             wait = int(cooldown - elapsed) + 1
             raise HTTPException(
                 status_code=429,
@@ -168,15 +193,32 @@ def verify_account(
                 headers={"Retry-After": str(wait)},
             )
 
+    verify_token = account.verify_token
+    platform = account.platform
+    identifier = account.identifier
     account.verify_attempted_at = now
     account.verify_attempts += 1
     db.add(account)
     db.commit()
 
-    ok, detail = check_signature(account.platform, account.identifier, account.verify_token)
+    ok, detail = check_signature(platform, identifier, verify_token)
     if not ok:
+        db.refresh(account)
         return AccountVerifyResult(ok=False, detail=detail, account=account)
 
+    # 重新加锁落库验证结果，防止验证期间账号已被解绑。
+    final = db.exec(
+        update(Account)
+        .where(Account.id == account_id, Account.user_id == user.id)
+        .values(identifier=Account.identifier)
+    )
+    if final.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="账号不存在")
+    account = db.get(Account, account_id, populate_existing=True)
+    if account is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="账号不存在")
     account.verified_at = utcnow()
     # 验证完就把码清掉，签名里那一行可以删了。
     account.verify_token = None

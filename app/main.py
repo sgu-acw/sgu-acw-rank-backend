@@ -8,6 +8,7 @@ cookies need no ``SameSite=None`` and there is no CORS configuration at all.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -166,15 +167,53 @@ def create_app() -> FastAPI:
     # 题库：题目/版本/提交记录。表由 init_db 的 create_all 建立。
     app.include_router(learning.router, prefix=API_PREFIX)
 
+    alerts_lock = threading.Lock()
+    alerts_seeded = False
+    open_api_alerts: set[str] = set()
+
+    def _ensure_alerts_seeded() -> None:
+        nonlocal alerts_seeded
+        if alerts_seeded:
+            return
+        with alerts_lock:
+            if alerts_seeded:
+                return
+            try:
+                with Session(get_engine()) as db:
+                    keys = db.exec(
+                        select(models.AdminNotification.fingerprint).where(
+                            models.AdminNotification.fingerprint.like("api:%"),  # type: ignore[attr-defined]
+                            models.AdminNotification.resolved_at.is_(None),  # type: ignore[union-attr]
+                        )
+                    ).all()
+                    open_api_alerts.update(keys)
+            except Exception:
+                logger.exception("could not load open API health notifications")
+                return
+            alerts_seeded = True
+
     def record_request_health(method: str, path: str, failed: bool) -> None:
+        key = f"api:{method}:{path}"
+        if not failed:
+            _ensure_alerts_seeded()
+            with alerts_lock:
+                if key not in open_api_alerts:
+                    return
         try:
             with session_scope() as db:
-                key = f"api:{method}:{path}"
                 if failed:
-                    notices.report(db, key, "服务接口异常",
-                                   f"{method} {path} 返回服务器错误，请查看服务日志。")
+                    notices.report(
+                        db,
+                        key,
+                        "服务接口异常",
+                        f"{method} {path} 返回服务器错误，请查看服务日志。",
+                    )
+                    with alerts_lock:
+                        open_api_alerts.add(key)
                 else:
                     notices.resolve(db, key)
+                    with alerts_lock:
+                        open_api_alerts.discard(key)
         except Exception:
             logger.exception("could not persist API health notification")
 
@@ -187,15 +226,26 @@ def create_app() -> FastAPI:
             response = JSONResponse(status_code=500, content={"detail": "服务暂时异常，请稍后重试"})
         route = request.scope.get("route")
         # 使用路由模板，不记录查询参数、正文、密码或令牌。
-        if route and (response.status_code >= 500 or response.status_code < 400):
-            await run_in_threadpool(record_request_health, request.method, route.path,
-                                    response.status_code >= 500)
+        if route:
+            if response.status_code >= 500:
+                await run_in_threadpool(record_request_health, request.method, route.path, True)
+            elif response.status_code < 400:
+                key = f"api:{request.method}:{route.path}"
+                # 快速路径：已初始化且无未恢复告警时零数据库 IO、零线程池切换。
+                if not alerts_seeded or key in open_api_alerts:
+                    await run_in_threadpool(
+                        record_request_health, request.method, route.path, False
+                    )
         return response
 
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(_request, exc: StarletteHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(_request, exc: RequestValidationError) -> JSONResponse:

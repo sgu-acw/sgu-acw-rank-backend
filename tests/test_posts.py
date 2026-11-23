@@ -266,7 +266,7 @@ def test_rss_feed(client, db):
     assert r.status_code == 200
     assert "application/rss+xml" in r.headers["content-type"]
     assert "RSS文章" in r.text
-    assert "/blog/rss-post" in r.text
+    assert "/post/rss-post" in r.text
 
 
 # --------------------------------------------------------------------------- #

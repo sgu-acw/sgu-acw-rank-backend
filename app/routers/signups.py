@@ -22,19 +22,45 @@ import io
 import json
 import math
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import openpyxl
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import AwareDatetime, BaseModel, Field
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlmodel import Session, select
 
 from .. import camps as camps_mod
-from ..deps import get_current_user, get_optional_user, get_session, require_admin
+from ..deps import (
+    get_current_user,
+    get_optional_user,
+    get_session,
+    require_admin,
+    require_origin_secret,
+)
 from ..models import Platform, Signup, SignupEntry, User, utcnow
 
-router = APIRouter(tags=["signups"])
+router = APIRouter(tags=["signups"], dependencies=[Depends(require_origin_secret)])
+CHINA_TZ = timezone(timedelta(hours=8))
+_INVALID_SHEET_CHARS_RE = re.compile(r"[\[\]\*\?:/\\]+")
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_sheet_title(name: str) -> str:
+    cleaned = _INVALID_SHEET_CHARS_RE.sub("_", name or "").strip().strip("'")
+    return (cleaned or "报名名单")[:31]
+
+
+def _safe_excel_cell(value: object) -> object:
+    if isinstance(value, str) and value and value[0] in _FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
+def _format_cst(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(CHINA_TZ).strftime("%Y-%m-%d %H:%M")
 
 FIELD_TYPES = {"text", "textarea", "number", "select", "multiselect", "checkbox", "phone", "email"}
 
@@ -246,6 +272,48 @@ def _summary(s: Signup, db: Session, now: datetime, user: User | None = None) ->
     )
 
 
+def _summarize_many(
+    rows: list[Signup], db: Session, now: datetime, user: User | None = None
+) -> list[SignupSummary]:
+    if not rows:
+        return []
+    ids = [s.id for s in rows if s.id is not None]
+    counts: dict[int, int] = dict(
+        db.exec(
+            select(SignupEntry.signup_id, func.count())
+            .where(SignupEntry.signup_id.in_(ids))  # type: ignore[attr-defined]
+            .group_by(SignupEntry.signup_id)
+        ).all()
+    )
+    my_ids: set[int] = set()
+    if user is not None and user.id is not None:
+        my_ids = set(
+            db.exec(
+                select(SignupEntry.signup_id).where(
+                    SignupEntry.signup_id.in_(ids),  # type: ignore[attr-defined]
+                    SignupEntry.user_id == user.id,
+                )
+            ).all()
+        )
+    return [
+        SignupSummary(
+            id=s.id or 0,
+            name=s.name,
+            description=s.description,
+            open_at=s.open_at,
+            close_at=s.close_at,
+            status=_status(s, now),
+            capacity=s.capacity,
+            entry_count=int(counts.get(s.id or 0, 0)),
+            my_entry=(s.id or 0) in my_ids,
+            fields=_fields(s),
+            required_platforms=_required_platforms(s),
+            required_years=_required_years(s),
+        )
+        for s in rows
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # 公开 / 成员
 # --------------------------------------------------------------------------- #
@@ -257,8 +325,8 @@ def list_signups(
     user: User | None = Depends(get_optional_user),
 ) -> list[SignupSummary]:
     now = datetime.now(UTC)
-    rows = db.exec(select(Signup).order_by(Signup.open_at.desc())).all()  # type: ignore[attr-defined]
-    return [_summary(s, db, now, user) for s in rows]
+    rows = list(db.exec(select(Signup).order_by(Signup.open_at.desc())).all())  # type: ignore[attr-defined]
+    return _summarize_many(rows, db, now, user)
 
 
 @router.get("/signups/{signup_id}", response_model=SignupSummary)
@@ -423,8 +491,8 @@ def admin_list(
     db: Session = Depends(get_session),
 ) -> list[SignupSummary]:
     now = datetime.now(UTC)
-    rows = db.exec(select(Signup).order_by(Signup.open_at.desc())).all()  # type: ignore[attr-defined]
-    return [_summary(s, db, now) for s in rows]
+    rows = list(db.exec(select(Signup).order_by(Signup.open_at.desc())).all())  # type: ignore[attr-defined]
+    return _summarize_many(rows, db, now)
 
 
 @router.post("/admin/signups", response_model=SignupSummary, status_code=201)
@@ -584,19 +652,23 @@ def admin_export(
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = s.name[:28]
+    ws.title = _safe_sheet_title(s.name)
     headers = ["姓名", "学号", "班级"] + [f["label"] for f in fields] + ["报名时间", "更新时间"]
-    ws.append(headers)
+    ws.append([_safe_excel_cell(h) for h in headers])
     for e in entries:
-        row = [e.display_name, e.student_id, e.class_label or ""]
+        row: list[object] = [
+            _safe_excel_cell(e.display_name),
+            _safe_excel_cell(e.student_id),
+            _safe_excel_cell(e.class_label or ""),
+        ]
         for f in fields:
             v = e.answers.get(f["key"], "")
             if f["type"] == "checkbox":
                 v = "是" if v else ""
             elif isinstance(v, list):
                 v = "、".join(str(x) for x in v)
-            row.append(v)
-        row += [e.created_at.strftime("%Y-%m-%d %H:%M"), e.updated_at.strftime("%Y-%m-%d %H:%M")]
+            row.append(_safe_excel_cell(v))
+        row += [_format_cst(e.created_at), _format_cst(e.updated_at)]
         ws.append(row)
     buf = io.BytesIO()
     wb.save(buf)

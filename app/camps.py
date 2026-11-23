@@ -240,6 +240,8 @@ def leaderboard(session: Session, camp: Camp) -> list[tuple[User, int, dict[str,
             CampRegistration.camp_id == camp.id,
         )
     ).all()
+    if not users:
+        return []
     snapshots = session.exec(
         select(Account.user_id, Account.platform, SolvedSnapshot.problems_json)
         .join(SolvedSnapshot, SolvedSnapshot.account_id == Account.id)

@@ -16,7 +16,13 @@ from sqlmodel import Session, func, select
 
 from .. import camps as camps_mod
 from ..db import get_engine
-from ..deps import get_current_user, get_optional_user, get_session, require_admin
+from ..deps import (
+    get_current_user,
+    get_optional_user,
+    get_session,
+    require_admin,
+    require_origin_secret,
+)
 from ..models import (
     Camp,
     CampAccountResult,
@@ -33,7 +39,7 @@ from ..models import (
 from ..problems import normalize_key
 from .problemlists import _fetch_and_cache
 
-router = APIRouter(tags=["camps"])
+router = APIRouter(tags=["camps"], dependencies=[Depends(require_origin_secret)])
 
 
 # --------------------------------------------------------------------------- #

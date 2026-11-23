@@ -16,6 +16,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import update
+from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, select
 
 from ..db import get_session
@@ -125,7 +127,7 @@ def build_practice_rank(
     statement = select(DailyProgress).where(DailyProgress.date >= since)
     if platform:
         if platform not in Platform.ALL:
-            raise ValueError("不支持的平台")
+            raise HTTPException(status_code=400, detail="不支持的平台")
         statement = statement.where(DailyProgress.platform == platform)
     rows = list(db.exec(statement).all())
 
@@ -322,30 +324,7 @@ def manual_refresh(
     额度在真正开始抓之前扣掉，抓失败也不退：失败往往是平台限流，退了额度
     只会让人反复重试，反而更容易被限。
     """
-    week = _current_week_start()
-    quota = db.exec(
-        select(RefreshQuota).where(
-            RefreshQuota.user_id == current.id,
-            RefreshQuota.week_start == week,
-        )
-    ).first()
-
-    if quota is None:
-        quota = RefreshQuota(user_id=current.id, week_start=week, used=0)
-        db.add(quota)
-        db.flush()
-
-    if quota.remaining <= 0:
-        raise HTTPException(
-            status_code=429,
-            detail=f"本周的手动刷新次数已用完（{RefreshQuota.WEEKLY_LIMIT} 次），下周一重置",
-        )
-
-    quota.used += 1
-    db.add(quota)
-    db.commit()
-
-    # 只抓自己的账号，且忽略调度周期。
+    # 先确认有已验证的账号，避免空账号白白扣掉每周额度。
     accounts = list(
         db.exec(
             select(Account).where(
@@ -354,26 +333,66 @@ def manual_refresh(
             )
         ).all()
     )
+    if not accounts:
+        raise HTTPException(status_code=400, detail="请先绑定并验证至少一个平台账号")
 
+    week = _current_week_start()
+    # 原子初始化 + 条件自增额度，确保并发点击不会超出每周上限。
+    db.exec(
+        insert(RefreshQuota)
+        .values(user_id=current.id, week_start=week, used=0)
+        .on_conflict_do_nothing(index_elements=["user_id", "week_start"])
+    )
+    claimed = db.exec(
+        update(RefreshQuota)
+        .where(
+            RefreshQuota.user_id == current.id,
+            RefreshQuota.week_start == week,
+            RefreshQuota.used < RefreshQuota.WEEKLY_LIMIT,
+        )
+        .values(used=RefreshQuota.used + 1)
+    )
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=429,
+            detail=f"本周的手动刷新次数已用完（{RefreshQuota.WEEKLY_LIMIT} 次），下周一重置",
+        )
+    quota = db.exec(
+        select(RefreshQuota).where(
+            RefreshQuota.user_id == current.id,
+            RefreshQuota.week_start == week,
+        )
+    ).one()
+    remaining = max(0, RefreshQuota.WEEKLY_LIMIT - quota.used)
+    db.commit()
+
+    account_ids = [a.id for a in accounts if a.id is not None]
     synced = 0
     added = 0
     failures: list[str] = []
-    for account in accounts:
+    for account_id in account_ids:
+        account = db.get(Account, account_id, populate_existing=True)
+        if account is None:
+            continue
         ok, detail, count = sync_account(db, account, force=True)
+        db.commit()
         if ok:
             synced += 1
             added += count
         else:
             failures.append(f"{Platform.LABELS.get(account.platform, account.platform)}: {detail}")
-        # rating 也顺手刷新，否则「刷新」之后 rating 还是旧的。
-        sync_rating(db, account, force=True)
-    db.commit()
+        # rating 也顺手刷新，独立提交避免在外部请求期间持有写锁。
+        account = db.get(Account, account_id, populate_existing=True)
+        if account is not None:
+            sync_rating(db, account, force=True)
+            db.commit()
 
     return {
         "synced": synced,
         "added": added,
         "failures": failures,
-        "remaining": max(0, RefreshQuota.WEEKLY_LIMIT - quota.used),
+        "remaining": remaining,
     }
 
 
@@ -401,7 +420,7 @@ def rating_board(
     洛谷的 1600 完全不是一回事），混在一起排序会误导人。
     """
     if platform not in Platform.ALL:
-        raise ValueError("不支持的平台")
+        raise HTTPException(status_code=400, detail="不支持的平台")
 
     statement = select(Account).where(
         Account.platform == platform,
@@ -489,21 +508,29 @@ def dashboard(
 
     accounts = list(
         db.exec(
-            select(Account).where(
-                Account.user_id == current.id,
-                Account.verified_at.is_not(None),  # type: ignore[union-attr]
-            )
+            select(Account)
+            .where(Account.user_id == current.id)
+            .order_by(Account.platform, Account.created_at)  # type: ignore[attr-defined]
         ).all()
     )
 
-    account_ids = [a.id for a in accounts]
+    verified_account_ids = [a.id for a in accounts if a.verified_at is not None]
     rows: list[DailyProgress] = []
-    if account_ids:
+    active_dates: set[str] = set()
+    if verified_account_ids:
         rows = list(
             db.exec(
                 select(DailyProgress).where(
-                    DailyProgress.account_id.in_(account_ids),  # type: ignore[attr-defined]
+                    DailyProgress.account_id.in_(verified_account_ids),  # type: ignore[attr-defined]
                     DailyProgress.date >= since,
+                )
+            ).all()
+        )
+        active_dates = set(
+            db.exec(
+                select(DailyProgress.date).where(
+                    DailyProgress.account_id.in_(verified_account_ids),  # type: ignore[attr-defined]
+                    DailyProgress.solved_count > 0,
                 )
             ).all()
         )
@@ -512,6 +539,15 @@ def dashboard(
     by_date: dict[str, int] = {}
     for row in rows:
         by_date[row.date] = by_date.get(row.date, 0) + row.solved_count
+
+    # 计算当前连续刷题天数（今天尚未做题时，从昨天往前数，不提前清零）。
+    streak_cursor = date.fromisoformat(today)
+    if today not in active_dates:
+        streak_cursor -= timedelta(days=1)
+    practice_streak = 0
+    while streak_cursor.isoformat() in active_dates:
+        practice_streak += 1
+        streak_cursor -= timedelta(days=1)
 
     week_start = _recent_dates(7)[0]
     week_total = sum(count for date, count in by_date.items() if date >= week_start)
@@ -541,6 +577,7 @@ def dashboard(
         today=today_total,
         week=week_total,
         total=window_total,
+        practice_streak=practice_streak,
         days=[PracticeDay(date=d, count=by_date.get(d, 0)) for d in window],
         practice_rank=rank_value,
         practice_total=rank_total,
@@ -553,6 +590,9 @@ def dashboard(
                 verified=a.verified_at is not None,
                 rating=a.rating,
                 max_rating=a.max_rating,
+                sync_flag=a.sync_flag,
+                consecutive_failures=a.consecutive_failures,
+                last_error=a.last_error,
             )
             for a in accounts
         ],

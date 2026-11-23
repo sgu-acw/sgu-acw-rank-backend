@@ -18,7 +18,7 @@ from sqlmodel import Session, func, select
 from .. import academic, editorials
 from ..cleanup import delete_user_accounts, delete_user_references
 from ..db import get_session
-from ..deps import require_admin
+from ..deps import require_admin, require_origin_secret
 from ..models import (
     Account,
     DailyProblem,
@@ -53,7 +53,7 @@ from ..student_id import StudentIdError, parse_student_id
 router = APIRouter(
     prefix="/admin",
     tags=["admin"],
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_origin_secret), Depends(require_admin)],
 )
 
 
@@ -340,6 +340,8 @@ def update_user(
     if payload.role is not None and payload.role != user.role:
         if user.is_root:
             raise HTTPException(status_code=403, detail="不能修改 root 的角色")
+        if user.id == admin.id and payload.role not in Role.ADMINISTRATIVE:
+            raise HTTPException(status_code=400, detail="不能撤销自己的管理员权限")
         if payload.role == Role.ROOT and not admin.is_root:
             raise HTTPException(status_code=403, detail="只有 root 可以授予 root")
         # 管理员之间平级：任何管理员都能授予或撤销管理员。
@@ -348,6 +350,8 @@ def update_user(
     if payload.status is not None and payload.status != user.status:
         if user.is_root:
             raise HTTPException(status_code=403, detail="不能停用 root")
+        if user.id == admin.id and payload.status == UserStatus.DISABLED:
+            raise HTTPException(status_code=400, detail="不能停用自己")
         user.status = payload.status
         if payload.status == UserStatus.DISABLED:
             # A disabled account should not keep working sessions around.
@@ -403,7 +407,7 @@ def delete_user(
     for row in db.exec(select(UserSession).where(UserSession.user_id == user.id)).all():
         db.delete(row)
     delete_user_accounts(db, user.id)
-    delete_user_references(db, user.id)
+    delete_user_references(db, user.id, reassign_to_user_id=admin.id)
     db.delete(user)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -469,21 +473,26 @@ def stats(db: Session = Depends(get_session)) -> dict:
     admins = db.exec(
         select(func.count()).select_from(User).where(User.role.in_(Role.ADMINISTRATIVE))  # type: ignore[attr-defined]
     ).one()
-    live_invites = [row for row in db.exec(select(Invite)).all() if row.is_usable]
-    # 开了推送的成员数：按 user_id 去重（一人多设备只算一次）。
-    push_users = len(
-        set(
-            db.exec(select(PushSubscription.user_id)).all()
+    now = utcnow()
+    live_invites = db.exec(
+        select(func.count())
+        .select_from(Invite)
+        .where(
+            Invite.revoked_at.is_(None),  # type: ignore[union-attr]
+            Invite.expires_at > now,
+            Invite.use_count < Invite.max_uses,
         )
-    )
-    push_devices = len(db.exec(select(PushSubscription)).all())
+    ).one()
+    # 开了推送的成员数：按 user_id 去重（一人多设备只算一次）。
+    push_users = db.exec(select(func.count(func.distinct(PushSubscription.user_id)))).one()
+    push_devices = db.exec(select(func.count()).select_from(PushSubscription)).one()
     return {
         "user_count": int(total),
         "active_count": int(active),
         "admin_count": int(admins),
-        "usable_invite_count": len(live_invites),
-        "push_subscriber_count": push_users,
-        "push_device_count": push_devices,
+        "usable_invite_count": int(live_invites),
+        "push_subscriber_count": int(push_users),
+        "push_device_count": int(push_devices),
     }
 
 
@@ -697,13 +706,26 @@ def list_editorials(
         statement = statement.where(Editorial.status == status_filter)
     if q:
         like = f"%{q}%"
+        matched_keys = select(ProblemCache.key).where(
+            ProblemCache.platform == "codeforces",  # type: ignore[arg-type]
+            ProblemCache.name.ilike(like),  # type: ignore[attr-defined]
+        )
         statement = statement.where(
-            or_(Editorial.key.ilike(like), Editorial.day.ilike(like))  # type: ignore[attr-defined]
+            or_(
+                Editorial.key.ilike(like),  # type: ignore[attr-defined]
+                Editorial.day.ilike(like),  # type: ignore[attr-defined]
+                Editorial.key.in_(matched_keys),  # type: ignore[attr-defined]
+            )
         )
 
-    rows = db.exec(statement.order_by(Editorial.day.desc(), Editorial.id.desc())).all()  # type: ignore[attr-defined]
-    total = len(rows)
-    page = rows[offset : offset + limit]
+    total = int(db.exec(select(func.count()).select_from(statement.subquery())).one())
+    page = list(
+        db.exec(
+            statement.order_by(Editorial.day.desc(), Editorial.id.desc())  # type: ignore[attr-defined]
+            .offset(offset)
+            .limit(limit)
+        ).all()
+    )
 
     # 一次把题目元信息查出来，避免逐条查库。
     keys = [row.key for row in page]
@@ -804,6 +826,10 @@ def publish_editorial(
     row = db.get(Editorial, editorial_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="没有这篇题解")
+    if row.status in (EditorialStatus.FAILED, EditorialStatus.PENDING) or not row.body.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="题解尚未生成或正文为空，不能公布"
+        )
 
     now = utcnow()
     if row.published_at is None:
@@ -901,8 +927,8 @@ def list_missing_editorials(
     """
     from .. import daily as daily_mod
 
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
     today = daily_mod.workshop_today()
+    cutoff = (date.fromisoformat(today) - timedelta(days=days)).isoformat()
     problems = db.exec(
         select(DailyProblem)
         .where(DailyProblem.day >= cutoff)  # type: ignore[operator]

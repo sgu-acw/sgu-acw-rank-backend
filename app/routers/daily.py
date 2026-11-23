@@ -12,12 +12,12 @@ from sqlmodel import Session, select
 from .. import daily
 from ..daily import CHINA_TZ, solved_by_count
 from ..db import get_session
-from ..deps import get_optional_user, require_admin
+from ..deps import get_optional_user, require_admin, require_origin_secret
 from ..models import DailyProblem, DailyProblemSolve, ProblemCache, User
 from ..problemlists import solved_keys
 from ..problems import problem_url
 
-router = APIRouter(tags=["daily"])
+router = APIRouter(tags=["daily"], dependencies=[Depends(require_origin_secret)])
 
 
 class DailyProblemEntry(BaseModel):
@@ -127,14 +127,21 @@ def _checkin_stats(session: Session, user: User | None, day: str) -> dict:
 
 
 def _checked_in_names(session: Session, day: str) -> list[str]:
-    """今天签到的人。公开信息，谁签到了大家都看得到。"""
+    """今天签到的人。公开信息，按首次过题顺序去重返回。"""
     rows = session.exec(
-        select(User.display_name)
+        select(User.id, User.display_name)
         .join(DailyProblemSolve, DailyProblemSolve.user_id == User.id)  # type: ignore[arg-type]
         .where(DailyProblemSolve.day == day)
         .order_by(DailyProblemSolve.created_at)  # type: ignore[arg-type]
     ).all()
-    return [name for name in rows if name]
+    seen: set[int] = set()
+    names: list[str] = []
+    for uid, name in rows:
+        if uid in seen or not name:
+            continue
+        seen.add(uid)
+        names.append(name)
+    return names
 
 
 def _board(session: Session, day: str, user: User | None) -> DailyProblemBoard:
@@ -269,7 +276,7 @@ def get_daily_solvers(
     和签到榜的区别：签到榜是「谁连续来了几天」，这个是「哪道题谁先做出来」。
     一道题没人通过就不出现在列表里。
     """
-    target = day or daily.workshop_today()
+    target = _validate_day(day) if day else daily.workshop_today()
     problems = daily.daily_for_day(session, target)
     if not problems:
         return DailySolversBoard(day=target)

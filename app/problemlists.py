@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from .models import (
@@ -41,7 +42,12 @@ def solved_keys(db: Session, user_id: int) -> set[tuple[str, str]]:
 
     同一平台的主号小号取并集——这与练习量榜的口径一致。
     """
-    accounts = db.exec(select(Account).where(Account.user_id == user_id)).all()
+    accounts = db.exec(
+        select(Account).where(
+            Account.user_id == user_id,
+            Account.verified_at.is_not(None),  # type: ignore[union-attr]
+        )
+    ).all()
     if not accounts:
         return set()
 
@@ -247,19 +253,107 @@ def detail(
     return out
 
 
-def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListRankEntry]:
-    """题单的完成度排行榜：每个成员过了这个题单里的多少题。
+def _count_items(
+    items: list[ProblemListItem],
+    done_set: set[tuple[str, str]] | None,
+    local_done: set[str],
+) -> tuple[int, int]:
+    if done_set is None:
+        return len(items), 0
+    done = sum(
+        1
+        for item in items
+        if (
+            item.key in local_done
+            if item.platform == Platform.LEARN
+            else (item.platform, item.key) in done_set
+        )
+    )
+    return len(items), done
 
-    只统计**有绑定平台账号**的成员。没绑账号的人完成度恒为 0，把他们列进
-    来会淹没真正在练的人，也会让人以为「大家都还没开始」。
 
-    合集要先把下面所有题单的题合并起来算——完成度按「这个合集里总共过了
-    多少题」，而不是「几个子题单做完了」。
-    """
-    from .models import Role, User, UserStatus
-    from .schemas import ProblemListRankEntry
+def summarize_many(
+    db: Session,
+    problem_lists: list[ProblemList],
+    *,
+    done_set: set[tuple[str, str]] | None,
+    viewer_id: int | None = None,
+) -> list[ProblemListPublic]:
+    """批量生成题单/合集概要，避免对每个题单和子题单逐条查库。"""
+    if not problem_lists:
+        return []
 
-    # 合集：把子题单的题全收集起来。
+    collection_ids = [pl.id or 0 for pl in problem_lists if pl.is_collection]
+    children_by_col: dict[int, list[ProblemList]] = {}
+    if collection_ids:
+        all_children = db.exec(
+            select(ProblemList)
+            .where(ProblemList.collection_id.in_(collection_ids))  # type: ignore[attr-defined]
+            .order_by(ProblemList.position, ProblemList.id)  # type: ignore[attr-defined]
+        ).all()
+        for child in all_children:
+            if child.collection_id is not None:
+                children_by_col.setdefault(child.collection_id, []).append(child)
+
+    leaf_ids: set[int] = set()
+    for pl in problem_lists:
+        if pl.is_collection:
+            for child in children_by_col.get(pl.id or 0, []):
+                if child.id:
+                    leaf_ids.add(child.id)
+        elif pl.id:
+            leaf_ids.add(pl.id)
+
+    items_by_list: dict[int, list[ProblemListItem]] = {}
+    has_learn = False
+    if leaf_ids:
+        for item in db.exec(
+            select(ProblemListItem).where(
+                ProblemListItem.list_id.in_(leaf_ids)  # type: ignore[attr-defined]
+            )
+        ).all():
+            items_by_list.setdefault(item.list_id, []).append(item)
+            if item.platform == Platform.LEARN:
+                has_learn = True
+
+    local_done: set[str] = set()
+    if done_set is not None and viewer_id is not None and has_learn:
+        from .learning_helpers import learn_done_keys
+
+        local_done = learn_done_keys(db, viewer_id)
+
+    result: list[ProblemListPublic] = []
+    for pl in problem_lists:
+        info = ProblemListPublic(
+            id=pl.id or 0,
+            kind=pl.kind,
+            title=pl.title,
+            description=pl.description,
+            collection_id=pl.collection_id,
+            position=pl.position,
+            created_at=pl.created_at,
+            updated_at=pl.updated_at,
+        )
+        if pl.is_collection:
+            children = children_by_col.get(pl.id or 0, [])
+            info.item_count = len(children)
+            for child in children:
+                total, done = _count_items(
+                    items_by_list.get(child.id or 0, []), done_set, local_done
+                )
+                info.total_problems += total
+                info.done_count += done
+        else:
+            total, done = _count_items(items_by_list.get(pl.id or 0, []), done_set, local_done)
+            info.item_count = total
+            info.total_problems = total
+            info.done_count = done
+        result.append(info)
+    return result
+
+
+def _rankable_wanted(db: Session, problem_list: ProblemList) -> set[tuple[str, str]]:
+    """收集题单或合集下可计入完成度榜单的外部平台题目（去重）。"""
     if problem_list.is_collection:
         children = _children(db, problem_list.id or 0)
         child_ids = [c.id or 0 for c in children]
@@ -276,15 +370,27 @@ def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListR
         items = db.exec(
             select(ProblemListItem).where(ProblemListItem.list_id == problem_list.id)
         ).all()
+    # 本地练习题的 AC 是客户端自报的，不参与成员完成度榜单口径。
+    return {(i.platform, i.key) for i in items if i.platform != Platform.LEARN}
 
-    # 本地练习题的 AC 是客户端自报的，不能算进成员完成度榜单；
-    # 留在列表里展示，但不参与 wanted/total 的统计口径。
-    rankable = [i for i in items if i.platform != Platform.LEARN]
-    total = len(rankable)
+
+def rankable_problem_count(db: Session, problem_list: ProblemList) -> int:
+    """题单或合集中参与完成度排行榜的去重题目数。"""
+    return len(_rankable_wanted(db, problem_list))
+
+
+def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListRankEntry]:
+    """题单的完成度排行榜：每个成员过了这个题单里的多少题。
+
+    只统计**有绑定平台账号**的成员。批量读取快照与最近练习日，避免 N+1 查询。
+    """
+    from .models import Role, User, UserStatus
+    from .schemas import ProblemListRankEntry
+
+    wanted = _rankable_wanted(db, problem_list)
+    total = len(wanted)
     if total == 0:
         return []
-
-    wanted = {(item.platform, item.key) for item in rankable}
 
     # 有绑定账号的成员。root 不算——它不是成员。
     bound_ids = select(Account.user_id).where(Account.verified_at.is_not(None))  # type: ignore[union-attr]
@@ -297,30 +403,53 @@ def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListR
             )
         ).all()
     )
+    if not members:
+        return []
+
+    member_ids = [m.id or 0 for m in members]
+    wanted_platforms = list({platform for platform, _ in wanted})
+
+    # 批量读取相关平台的已验证账号快照，一次查询按人汇总。
+    solved_by_user: dict[int, set[tuple[str, str]]] = {}
+    snapshots = db.exec(
+        select(Account.user_id, Account.platform, SolvedSnapshot.problems_json)
+        .join(SolvedSnapshot, SolvedSnapshot.account_id == Account.id)  # type: ignore[arg-type]
+        .where(
+            Account.user_id.in_(member_ids),  # type: ignore[attr-defined]
+            Account.verified_at.is_not(None),  # type: ignore[union-attr]
+            Account.platform.in_(wanted_platforms),  # type: ignore[attr-defined]
+        )
+    ).all()
+    for uid, platform, payload in snapshots:
+        try:
+            raw_keys = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        bucket = solved_by_user.setdefault(uid, set())
+        for k in raw_keys:
+            pair = (platform, str(k))
+            if pair in wanted:
+                bucket.add(pair)
+
+    # 批量读取每位成员最近一次有刷题记录的日期（SQL MAX 聚合）。
+    last_dates: dict[int, str] = {}
+    for uid, latest in db.exec(
+        select(Account.user_id, func.max(DailyProgress.date))
+        .join(DailyProgress, DailyProgress.account_id == Account.id)  # type: ignore[arg-type]
+        .where(
+            Account.user_id.in_(member_ids),  # type: ignore[attr-defined]
+            Account.verified_at.is_not(None),  # type: ignore[union-attr]
+            DailyProgress.solved_count > 0,
+        )
+        .group_by(Account.user_id)
+    ).all():
+        if latest:
+            last_dates[uid] = latest
 
     out: list[ProblemListRankEntry] = []
     for member in members:
-        solved = solved_keys(db, member.id or 0)
-        hit = solved & wanted
-        # 一题没过的也列出来，但排在最后（下面排序保证）。
+        hit = solved_by_user.get(member.id or 0, set())
         done = len(hit)
-
-        # 最后一次过这个题单里的题是哪天。用 daily_progress 反查，
-        # 比从时间戳算省事，而且和榜单的口径一致。
-        last_date: str | None = None
-        if hit:
-            rows = db.exec(
-                select(DailyProgress)
-                .join(Account, Account.id == DailyProgress.account_id)  # type: ignore[arg-type]
-                .where(
-                    Account.user_id == member.id,
-                    DailyProgress.solved_count > 0,
-                )
-                .order_by(DailyProgress.date.desc())  # type: ignore[attr-defined]
-            ).all()
-            if rows:
-                last_date = rows[0].date
-
         out.append(
             ProblemListRankEntry(
                 user_id=member.id or 0,
@@ -333,11 +462,9 @@ def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListR
                 done_count=done,
                 total=total,
                 percent=round(done / total * 100) if total else 0,
-                last_done_date=last_date,
+                last_done_date=last_dates.get(member.id or 0) if done else None,
             )
         )
 
-    # 完成数多的在前；一样多时按完成度（题单总题数相同，所以等价），
-    # 再一样就按学号，保证顺序稳定。
     out.sort(key=lambda e: (-e.done_count, e.student_id))
     return out

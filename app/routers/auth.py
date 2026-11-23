@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
+import threading
+import time
+from collections import deque
 from datetime import timedelta
 
 import pyotp
@@ -16,12 +20,13 @@ from sqlmodel import Session, select
 
 from ..config import get_settings
 from ..db import get_session
-from ..deps import get_current_user, get_optional_user, require_origin_secret
+from ..deps import get_current_session, get_current_user, get_optional_user, require_origin_secret
 from ..models import Invite, InviteUse, LoginTicket, User, UserSession, UserStatus, utcnow
 from ..schemas import (
     ChangePasswordRequest,
     LoginRequest,
     RegisterRequest,
+    SessionEntry,
     UpdateSelfRequest,
     UserSelf,
 )
@@ -45,6 +50,113 @@ router = APIRouter(
 #: path costs the same as a real one. Computed once at import: hashing on every
 #: miss would do the scrypt work twice and leak timing the other way.
 _DUMMY_HASH = hash_password("timing-equaliser-never-matches")
+
+#: 登录失败滑动窗口防爆破限制：按 (ip, student_id) 和 ip 双维度限流。
+LOGIN_RATE_WINDOW_SECONDS = 300
+LOGIN_MAX_FAILURES_PER_ACCOUNT = 10
+LOGIN_MAX_FAILURES_PER_IP = 30
+_login_rate_lock = threading.Lock()
+_login_failures_account: dict[tuple[str, str], deque[float]] = {}
+_login_failures_ip: dict[str, deque[float]] = {}
+
+
+def reset_login_rate_limits() -> None:
+    """清空登录失败计数，仅供测试使用。"""
+    with _login_rate_lock:
+        _login_failures_account.clear()
+        _login_failures_ip.clear()
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("cf-connecting-ip")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+def _prune_window(bucket: deque[float], now: float) -> None:
+    cutoff = now - LOGIN_RATE_WINDOW_SECONDS
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+
+
+def _check_login_rate_limit(ip: str, student_id: str) -> None:
+    now = time.monotonic()
+    with _login_rate_lock:
+        acc_bucket = _login_failures_account.get((ip, student_id))
+        if acc_bucket:
+            _prune_window(acc_bucket, now)
+            if len(acc_bucket) >= LOGIN_MAX_FAILURES_PER_ACCOUNT:
+                wait = max(1, int(LOGIN_RATE_WINDOW_SECONDS - (now - acc_bucket[0])) + 1)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"登录尝试过于频繁，请 {wait} 秒后再试",
+                    headers={"Retry-After": str(wait)},
+                )
+        ip_bucket = _login_failures_ip.get(ip)
+        if ip_bucket:
+            _prune_window(ip_bucket, now)
+            if len(ip_bucket) >= LOGIN_MAX_FAILURES_PER_IP:
+                wait = max(1, int(LOGIN_RATE_WINDOW_SECONDS - (now - ip_bucket[0])) + 1)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"登录尝试过于频繁，请 {wait} 秒后再试",
+                    headers={"Retry-After": str(wait)},
+                )
+
+
+def _record_login_failure(ip: str, student_id: str) -> None:
+    now = time.monotonic()
+    with _login_rate_lock:
+        acc_bucket = _login_failures_account.setdefault((ip, student_id), deque())
+        _prune_window(acc_bucket, now)
+        acc_bucket.append(now)
+        ip_bucket = _login_failures_ip.setdefault(ip, deque())
+        _prune_window(ip_bucket, now)
+        ip_bucket.append(now)
+
+
+def _clear_login_failures(ip: str, student_id: str) -> None:
+    with _login_rate_lock:
+        _login_failures_account.pop((ip, student_id), None)
+
+
+def _normalize_totp_code(raw: str) -> str:
+    return re.sub(r"\s+", "", raw or "")
+
+
+def _describe_user_agent(ua: str) -> str:
+    """将 User-Agent 归纳为易读的「浏览器 · 系统」标签。"""
+    s = ua or ""
+    if not s:
+        return "未知设备"
+    low = s.lower()
+    if "edg/" in low:
+        browser = "Edge"
+    elif "chrome/" in low or "crios/" in low:
+        browser = "Chrome"
+    elif "firefox/" in low:
+        browser = "Firefox"
+    elif "safari/" in low:
+        browser = "Safari"
+    else:
+        browser = "浏览器"
+
+    if "iphone" in low:
+        os_name = "iPhone"
+    elif "ipad" in low:
+        os_name = "iPad"
+    elif "android" in low:
+        os_name = "Android"
+    elif "mac os x" in low or "macintosh" in low:
+        os_name = "macOS"
+    elif "windows" in low:
+        os_name = "Windows"
+    elif "linux" in low:
+        os_name = "Linux"
+    else:
+        os_name = "未知系统"
+    return f"{browser} · {os_name}"
 
 
 def _issue_session(db: Session, user: User, request: Request) -> str:
@@ -184,6 +296,8 @@ def login(
     db: Session = Depends(get_session),
 ) -> dict:
     student_id = payload.student_id.strip().upper()
+    ip = _client_ip(request)
+    _check_login_rate_limit(ip, student_id)
     user = db.exec(select(User).where(User.student_id == student_id)).first()
 
     # Same message either way, so the response does not reveal which student ids
@@ -191,11 +305,15 @@ def login(
     # missing, keeping the timing comparable.
     if user is None:
         verify_password(payload.password, _DUMMY_HASH)
+        _record_login_failure(ip, student_id)
         raise HTTPException(status_code=401, detail="学号或密码错误")
     if not verify_password(payload.password, user.password_hash):
+        _record_login_failure(ip, student_id)
         raise HTTPException(status_code=401, detail="学号或密码错误")
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="账号已停用")
+
+    _clear_login_failures(ip, student_id)
 
     # 开了两步验证：先给一张签名的登录票据，等 TOTP 验完才发真 session。
     if user.totp_secret:
@@ -224,7 +342,7 @@ def login(
 
 class TotpLoginIn(BaseModel):
     ticket: str
-    code: str = Field(min_length=6, max_length=8)
+    code: str = Field(min_length=6, max_length=12)
 
 
 @router.post("/login/totp")
@@ -235,6 +353,7 @@ def login_totp(
     db: Session = Depends(get_session),
 ) -> dict:
     """第二步：票据 + TOTP 码 → 真 session。"""
+    code = _normalize_totp_code(payload.code)
     uid = verify_login_ticket(payload.ticket)
     if uid is None:
         raise HTTPException(status_code=401, detail="票据过期或无效，请重新登录")
@@ -264,7 +383,7 @@ def login_totp(
         (
             n
             for n in (step, step - 1, step + 1)
-            if pyotp.utils.strings_equal(totp.at(n * totp.interval), payload.code)
+            if pyotp.utils.strings_equal(totp.at(n * totp.interval), code)
         ),
         None,
     )
@@ -290,7 +409,7 @@ def login_totp(
 
 
 class TotpCodeIn(BaseModel):
-    code: str = Field(min_length=6, max_length=8)
+    code: str = Field(min_length=6, max_length=12)
 
 
 @router.post("/me/totp/begin")
@@ -333,9 +452,10 @@ def totp_enable(
     db: Session = Depends(get_session),
 ) -> dict:
     """验证一个码，把 pending 密钥转正。"""
+    code = _normalize_totp_code(payload.code)
     _lock_user(db, user)
     if user.totp_secret:
-        if pyotp.TOTP(user.totp_secret).verify(payload.code, valid_window=1):
+        if pyotp.TOTP(user.totp_secret).verify(code, valid_window=1):
             db.commit()
             return {"ok": True}
         raise HTTPException(status_code=409, detail="两步验证已开启")
@@ -345,7 +465,7 @@ def totp_enable(
         or user.totp_pending_expires_at <= utcnow()
     ):
         raise HTTPException(status_code=400, detail="待开启的两步验证已过期，请重新设置")
-    if not pyotp.TOTP(user.totp_pending_secret).verify(payload.code, valid_window=1):
+    if not pyotp.TOTP(user.totp_pending_secret).verify(code, valid_window=1):
         raise HTTPException(status_code=422, detail="验证码不对")
     user.totp_secret = user.totp_pending_secret
     user.totp_pending_secret = None
@@ -363,11 +483,12 @@ def totp_disable(
     db: Session = Depends(get_session),
 ) -> dict:
     """关掉两步验证——要先验一次码，免得拿到会话的人随手关掉别人的。"""
+    code = _normalize_totp_code(payload.code)
     _lock_user(db, user)
     if not user.totp_secret:
         db.commit()
         return {"ok": True}
-    if not pyotp.TOTP(user.totp_secret).verify(payload.code, valid_window=1):
+    if not pyotp.TOTP(user.totp_secret).verify(code, valid_window=1):
         raise HTTPException(status_code=422, detail="验证码不对")
     user.totp_secret = None
     user.totp_pending_secret = None
@@ -462,3 +583,75 @@ def change_password(
     # The caller's own session survives, so their cookie stays valid and no
     # re-login is needed.
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# 活跃会话 / 登录设备管理
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/sessions", response_model=list[SessionEntry])
+def list_sessions(
+    user: User = Depends(get_current_user),
+    current_session: UserSession = Depends(get_current_session),
+    db: Session = Depends(get_session),
+) -> list[SessionEntry]:
+    """列出当前成员所有未过期的登录设备，当前会话置顶。"""
+    now = utcnow()
+    rows = db.exec(
+        select(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.expires_at > now)
+        .order_by(UserSession.last_seen_at.desc())  # type: ignore[attr-defined]
+    ).all()
+    entries = [
+        SessionEntry(
+            id=row.id or 0,
+            ip=row.ip,
+            user_agent=row.user_agent,
+            device_label=_describe_user_agent(row.user_agent),
+            created_at=row.created_at,
+            last_seen_at=row.last_seen_at,
+            expires_at=row.expires_at,
+            is_current=row.id == current_session.id,
+        )
+        for row in rows
+    ]
+    entries.sort(key=lambda item: (not item.is_current, -item.last_seen_at.timestamp()))
+    return entries
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_session(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    current_session: UserSession = Depends(get_current_session),
+    db: Session = Depends(get_session),
+) -> Response:
+    """下线指定的其他登录设备。"""
+    if session_id == current_session.id:
+        raise HTTPException(status_code=400, detail="当前设备请使用退出登录")
+    row = db.get(UserSession, session_id)
+    if row is None or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    db.delete(row)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/sessions/revoke-others")
+def revoke_other_sessions(
+    user: User = Depends(get_current_user),
+    current_session: UserSession = Depends(get_current_session),
+    db: Session = Depends(get_session),
+) -> dict:
+    """一键下线除当前设备以外的所有登录会话。"""
+    rows = db.exec(
+        select(UserSession).where(
+            UserSession.user_id == user.id,
+            UserSession.id != current_session.id,
+        )
+    ).all()
+    for row in rows:
+        db.delete(row)
+    db.commit()
+    return {"revoked": len(rows)}

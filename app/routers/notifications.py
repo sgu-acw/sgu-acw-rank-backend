@@ -6,10 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, func, select
 
-from ..deps import get_session, require_admin
+from ..deps import get_session, require_admin, require_origin_secret
 from ..models import AdminNotification, NotificationRead, User
 
-router = APIRouter(prefix="/admin/notifications", tags=["notifications"])
+router = APIRouter(
+    prefix="/admin/notifications",
+    tags=["notifications"],
+    dependencies=[Depends(require_origin_secret)],
+)
 
 
 def unread_condition(user_id: int):

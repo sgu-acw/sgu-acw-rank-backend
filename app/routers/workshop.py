@@ -13,12 +13,13 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import AwareDatetime, BaseModel, Field
+from sqlalchemy import update
 from sqlmodel import Session, select
 
-from ..deps import get_session, require_admin
+from ..deps import get_session, require_admin, require_origin_secret
 from ..models import User, WorkshopStatusOverride
 
-router = APIRouter(tags=["workshop"])
+router = APIRouter(tags=["workshop"], dependencies=[Depends(require_origin_secret)])
 
 
 def _live_rows(session: Session) -> list[WorkshopStatusOverride]:
@@ -130,11 +131,13 @@ def set_override(
         updated_at=now,
     )
     session.add(row)
+    # 先 flush 取得 SQLite 写锁，确保随后读取 _live_rows 时串行化并发写入。
+    session.flush()
     # 新写的这条如果此刻就在生效窗口里，把其他同样生效中的关掉——
     # 同一时刻只能显示一个状态，最新写的赢。
     if _in_window(row, now):
         for old in _live_rows(session):
-            if old is not row and _in_window(old, now):
+            if old.id != row.id and _in_window(old, now):
                 old.active = False
                 session.add(old)
     session.commit()
@@ -158,8 +161,21 @@ def update_override(
     user: User = Depends(require_admin),
     session: Session = Depends(get_session),
 ) -> OverrideOut:
-    row = session.get(WorkshopStatusOverride, override_id)
+    # 先加写锁再读取，防止并发更新覆盖彼此的状态切换。
+    locked = session.exec(
+        update(WorkshopStatusOverride)
+        .where(
+            WorkshopStatusOverride.id == override_id,
+            WorkshopStatusOverride.active.is_(True),
+        )
+        .values(active=WorkshopStatusOverride.active)
+    )
+    if locked.rowcount != 1:
+        session.rollback()
+        raise HTTPException(status_code=404, detail="没有这条状态")
+    row = session.get(WorkshopStatusOverride, override_id, populate_existing=True)
     if row is None or not row.active:
+        session.rollback()
         raise HTTPException(status_code=404, detail="没有这条状态")
 
     fields = payload.model_fields_set
@@ -186,7 +202,7 @@ def update_override(
     session.add(row)
     if _in_window(row, now):
         for old in _live_rows(session):
-            if old is not row and _in_window(old, now):
+            if old.id != row.id and _in_window(old, now):
                 old.active = False
                 session.add(old)
     session.commit()

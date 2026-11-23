@@ -10,12 +10,12 @@ import hashlib
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import Session, select
 
 from .. import push as push_mod
-from ..deps import get_current_user, get_session, require_admin
+from ..deps import get_current_user, get_session, require_admin, require_origin_secret
 from ..models import (
     CampRegistration,
     PushDispatch,
@@ -25,7 +25,7 @@ from ..models import (
     UserStatus,
 )
 
-router = APIRouter(tags=["push"])
+router = APIRouter(tags=["push"], dependencies=[Depends(require_origin_secret)])
 
 
 class SubscribeIn(BaseModel):
@@ -45,6 +45,14 @@ class AnnounceIn(BaseModel):
     url: str = Field(default="/", max_length=200)
     #: all | admins | camp:<id>
     audience: str = Field(default="all", max_length=6000)
+
+    @field_validator("url")
+    @classmethod
+    def _relative_url(cls, value: str) -> str:
+        cleaned = (value or "/").strip()
+        if not cleaned.startswith("/") or cleaned.startswith("//"):
+            raise ValueError("跳转链接必须是站内路径（以 / 开头）")
+        return cleaned
 
 
 @router.get("/push/vapid-key")
@@ -108,7 +116,12 @@ def _audience_user_ids(db: Session, audience: str) -> list[int]:
     if audience == "admins":
         return [
             u.id
-            for u in db.exec(select(User).where(User.role.in_(Role.ADMINISTRATIVE))).all()  # type: ignore[attr-defined]
+            for u in db.exec(
+                select(User).where(
+                    User.status == UserStatus.ACTIVE,
+                    User.role.in_(Role.ADMINISTRATIVE),  # type: ignore[attr-defined]
+                )
+            ).all()
             if u.id
         ]
     if audience.startswith("camp:"):
@@ -118,7 +131,12 @@ def _audience_user_ids(db: Session, audience: str) -> list[int]:
             raise HTTPException(status_code=422, detail="非法群体") from None
         return list(
             db.exec(
-                select(CampRegistration.user_id).where(CampRegistration.camp_id == camp_id)
+                select(CampRegistration.user_id)
+                .join(User, User.id == CampRegistration.user_id)  # type: ignore[arg-type]
+                .where(
+                    CampRegistration.camp_id == camp_id,
+                    User.status == UserStatus.ACTIVE,
+                )
             ).all()
         )
     if audience.startswith("year:"):

@@ -409,6 +409,19 @@ class RatingResponse(BaseModel):
     generated_at: int
 
 
+class SessionEntry(BaseModel):
+    """当前用户的活跃登录会话，用于账号设置页查看和吊销设备。"""
+
+    id: int
+    ip: str = ""
+    user_agent: str = ""
+    device_label: str = ""
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    is_current: bool = False
+
+
 class DashboardAccount(BaseModel):
     """面板上的一个平台账号。"""
 
@@ -419,6 +432,9 @@ class DashboardAccount(BaseModel):
     verified: bool
     rating: int | None = None
     max_rating: int | None = None
+    sync_flag: str | None = None
+    consecutive_failures: int = 0
+    last_error: str | None = None
 
 
 class DashboardSummary(BaseModel):
@@ -434,6 +450,9 @@ class DashboardSummary(BaseModel):
     today: int = 0
     week: int = 0
     total: int = 0
+
+    #: 当前连续刷题天数（按练习日口径，今天未刷时从昨天算起）。
+    practice_streak: int = 0
 
     #: 最近 30 个练习日的每日过题数，从早到晚。
     days: list[PracticeDay] = Field(default_factory=list)
@@ -557,6 +576,23 @@ class ProblemItemCreate(BaseModel):
 
 class ProblemItemUpdate(BaseModel):
     note: str | None = Field(default=None, max_length=500)
+
+
+class BatchProblemImportRequest(BaseModel):
+    """批量向题单添加多道题目（每行一道，支持 URL 或题号）。"""
+
+    items: list[ProblemItemCreate] = Field(min_length=1, max_length=100)
+
+
+class BatchProblemImportError(BaseModel):
+    platform: str
+    key: str
+    detail: str
+
+
+class BatchProblemImportResult(BaseModel):
+    added: list[ProblemEntry] = Field(default_factory=list)
+    skipped: list[BatchProblemImportError] = Field(default_factory=list)
 
 
 class ReorderRequest(BaseModel):

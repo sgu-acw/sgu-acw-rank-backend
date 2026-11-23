@@ -5,7 +5,7 @@ from hashlib import sha256
 from typing import Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import update
 from sqlalchemy.dialects.sqlite import insert
@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from ..db import get_session
 from ..deps import get_current_user, require_admin, require_origin_secret
 from ..learning_models import LearningProblem, LearningRun, LearningVersion
-from ..models import User
+from ..models import CampProblem, Platform, ProblemCache, ProblemListItem, User
 
 router = APIRouter(dependencies=[Depends(require_origin_secret)], tags=["local-learning"])
 Environment = Literal["c", "cpp", "python", "java8", "java21"]
@@ -124,18 +124,22 @@ def list_problems(db: Session = Depends(get_session)):
         .where(LearningProblem.published_revision == LearningVersion.revision)
         .order_by(LearningProblem.id)
     ).all()
-    return [
-        {
-            "id": v.problem_id,
-            "version_id": v.id,
-            "revision": v.revision,
-            **{
-                k: json.loads(v.content_json).get(k, {"difficulty": "入门", "tags": []}.get(k))
-                for k in ("title", "chapter", "difficulty", "tags", "environments")
-            },
-        }
-        for v in rows
-    ]
+    out = []
+    for v in rows:
+        content = json.loads(v.content_json)
+        out.append(
+            {
+                "id": v.problem_id,
+                "version_id": v.id,
+                "revision": v.revision,
+                "title": content.get("title"),
+                "chapter": content.get("chapter"),
+                "difficulty": content.get("difficulty", "入门"),
+                "tags": content.get("tags", []),
+                "environments": content.get("environments"),
+            }
+        )
+    return out
 
 
 @router.get("/learning/problems/{problem_id}")
@@ -255,6 +259,83 @@ def publish(
     return serialize_version(v)
 
 
+@router.post("/admin/learning/problems/{problem_id}/unpublish")
+def unpublish_problem(
+    problem_id: int,
+    db: Session = Depends(get_session),
+    _user: User = Depends(require_admin),
+):
+    """下架已发布的学习题，使其不再对成员可见，保留草稿以便修改后重新发布。"""
+    db.exec(
+        update(LearningProblem)
+        .where(LearningProblem.id == problem_id)
+        .values(draft_revision=LearningProblem.draft_revision)
+    )
+    p = problem_or_404(db, problem_id)
+    db.refresh(p)
+    if p.published_revision is not None:
+        p.published_revision = None
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+    return serialize_draft(p)
+
+
+@router.delete("/admin/learning/problems/{problem_id}", status_code=204)
+def delete_problem(
+    problem_id: int,
+    db: Session = Depends(get_session),
+    _user: User = Depends(require_admin),
+) -> Response:
+    """删除未发布（或已下架）的学习题。已被题单/集训引用的题目需先移出再删。"""
+    db.exec(
+        update(LearningProblem)
+        .where(LearningProblem.id == problem_id)
+        .values(draft_revision=LearningProblem.draft_revision)
+    )
+    p = problem_or_404(db, problem_id)
+    db.refresh(p)
+    if p.published_revision is not None:
+        raise HTTPException(409, "请先下架该题目后再删除")
+
+    key = str(p.id)
+    in_list = db.exec(
+        select(ProblemListItem.id).where(
+            ProblemListItem.platform == Platform.LEARN, ProblemListItem.key == key
+        )
+    ).first()
+    in_camp = db.exec(
+        select(CampProblem.id).where(CampProblem.platform == Platform.LEARN, CampProblem.key == key)
+    ).first()
+    if in_list is not None or in_camp is not None:
+        raise HTTPException(409, "该题目仍被题单或集训引用，请先移出后再删除")
+
+    version_ids = [
+        v.id
+        for v in db.exec(
+            select(LearningVersion).where(LearningVersion.problem_id == p.id)
+        ).all()
+    ]
+    if version_ids:
+        for run in db.exec(
+            select(LearningRun).where(LearningRun.version_id.in_(version_ids))  # type: ignore[attr-defined]
+        ).all():
+            db.delete(run)
+        db.flush()
+        for ver in db.exec(
+            select(LearningVersion).where(LearningVersion.problem_id == p.id)
+        ).all():
+            db.delete(ver)
+        db.flush()
+    for cache in db.exec(
+        select(ProblemCache).where(ProblemCache.platform == Platform.LEARN, ProblemCache.key == key)
+    ).all():
+        db.delete(cache)
+    db.delete(p)
+    db.commit()
+    return Response(status_code=204)
+
+
 class RunBody(BaseModel):
     #: 新客户端重试时校验原账号；旧客户端可省略，幂等摘要保持兼容。
     expected_user_id: int | None = Field(default=None, gt=0)
@@ -309,24 +390,57 @@ def my_progress(db: Session = Depends(get_session), user: User = Depends(get_cur
 
 
 @router.get("/learning/runs")
-def my_runs(db: Session = Depends(get_session), user: User = Depends(get_current_user)):
-    rows = db.exec(
+def my_runs(
+    problem_id: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    stmt = (
         select(LearningRun, LearningVersion.problem_id)
         .join(LearningVersion, LearningVersion.id == LearningRun.version_id)
         .where(LearningRun.user_id == user.id)
-        .order_by(LearningRun.created_at.desc())
-        .limit(100)
-    ).all()
+    )
+    if problem_id is not None:
+        stmt = stmt.where(LearningVersion.problem_id == problem_id)
+    rows = db.exec(stmt.order_by(LearningRun.created_at.desc()).limit(100)).all()
     return [
         {
             "id": r.id,
             "version_id": r.version_id,
-            "problem_id": problem_id,
+            "problem_id": pid,
             "environment": r.environment,
             "runtime_version": r.runtime_version,
             "verdict": r.verdict,
             "created_at": r.created_at,
             "source": "client",
         }
-        for r, problem_id in rows
+        for r, pid in rows
     ]
+
+
+@router.get("/learning/runs/{run_id}")
+def get_my_run(
+    run_id: str,
+    db: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """查看本人某次提交的源码与结果详情。"""
+    row = db.exec(
+        select(LearningRun, LearningVersion.problem_id)
+        .join(LearningVersion, LearningVersion.id == LearningRun.version_id)
+        .where(LearningRun.id == run_id, LearningRun.user_id == user.id)
+    ).first()
+    if row is None:
+        raise HTTPException(404, "提交记录不存在")
+    r, pid = row
+    return {
+        "id": r.id,
+        "version_id": r.version_id,
+        "problem_id": pid,
+        "environment": r.environment,
+        "runtime_version": r.runtime_version,
+        "verdict": r.verdict,
+        "code": r.source,
+        "created_at": r.created_at,
+        "source": "client",
+    }

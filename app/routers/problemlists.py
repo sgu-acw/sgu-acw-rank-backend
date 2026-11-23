@@ -31,10 +31,15 @@ from ..problemlists import (
     cached_problems,
     completion_rank,
     detail,
+    rankable_problem_count,
     summarize,
+    summarize_many,
 )
 from ..problems import fetch_all_codeforces, fetch_one, normalize_key, problem_url
 from ..schemas import (
+    BatchProblemImportError,
+    BatchProblemImportRequest,
+    BatchProblemImportResult,
     ProblemEntry,
     ProblemItemCreate,
     ProblemItemUpdate,
@@ -94,10 +99,7 @@ def list_lists(
     from ..problemlists import solved_keys
 
     done_set = solved_keys(db, viewer.id) if viewer is not None else None
-    return [
-        summarize(db, row, done_set=done_set, viewer_id=viewer.id if viewer else None)
-        for row in rows
-    ]
+    return summarize_many(db, rows, done_set=done_set, viewer_id=viewer.id if viewer else None)
 
 
 @router.get("/{list_id}/rank", response_model=ProblemListRank)
@@ -116,10 +118,11 @@ def list_completion_rank(
         raise HTTPException(status_code=404, detail="题单不存在")
 
     entries = completion_rank(db, problem_list)
+    total = entries[0].total if entries else rankable_problem_count(db, problem_list)
     return ProblemListRank(
         list_id=list_id,
         title=problem_list.title,
-        total=entries[0].total if entries else 0,
+        total=total,
         entries=entries,
     )
 
@@ -247,6 +250,8 @@ def delete_list(
         child.collection_id = None
         db.add(child)
 
+    # 先 flush 子项删除与归属解绑，避免 PRAGMA foreign_keys=ON 下因 UoW 顺序触发外键错误。
+    db.flush()
     db.delete(problem_list)
     db.commit()
 
@@ -258,17 +263,26 @@ def reorder_lists(
     db: Session = Depends(get_session),
 ) -> list[ProblemListPublic]:
     """拖拽排序题单。按给出的 id 顺序重排。"""
+    if len(set(payload.ids)) != len(payload.ids):
+        raise HTTPException(status_code=400, detail="排序列表中包含重复的题单 ID")
+    existing = {
+        row.id: row
+        for row in db.exec(
+            select(ProblemList).where(ProblemList.id.in_(payload.ids))  # type: ignore[attr-defined]
+        ).all()
+    }
+    missing = [list_id for list_id in payload.ids if list_id not in existing]
+    if missing:
+        raise HTTPException(status_code=404, detail="排序列表包含不存在的题单")
+
+    ordered: list[ProblemList] = []
     for index, list_id in enumerate(payload.ids):
-        problem_list = db.get(ProblemList, list_id)
-        if problem_list is None:
-            continue
+        problem_list = existing[list_id]
         problem_list.position = index
         db.add(problem_list)
+        ordered.append(problem_list)
     db.commit()
-    return [
-        summarize(db, row, done_set=None)
-        for row in db.exec(select(ProblemList).where(ProblemList.id.in_(payload.ids))).all()  # type: ignore[attr-defined]
-    ]
+    return summarize_many(db, ordered, done_set=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -520,6 +534,13 @@ def add_problem(
     if duplicate is not None:
         raise HTTPException(status_code=409, detail="这道题已经在题单里了")
 
+    # 本地练习题先校验存在且已发布，校验失败不写入脏题单条目。
+    learn_problem = None
+    if payload.platform == Platform.LEARN:
+        from ..learning_helpers import learn_problem_or_400
+
+        learn_problem = learn_problem_or_400(db, key)
+
     last = db.exec(
         select(ProblemListItem)
         .where(ProblemListItem.list_id == list_id)
@@ -536,18 +557,19 @@ def add_problem(
         created_at=utcnow(),
     )
     db.add(item)
-    db.commit()
-    db.refresh(item)
 
-    # 本地练习题从 learning 表取题名写进缓存，不走外部抓取。
-    if payload.platform == Platform.LEARN:
-        from ..learning_helpers import learn_problem_or_400, upsert_learn_cache
+    if payload.platform == Platform.LEARN and learn_problem is not None:
+        from ..learning_helpers import upsert_learn_cache
 
-        cache = upsert_learn_cache(db, learn_problem_or_400(db, key))
+        cache = upsert_learn_cache(db, learn_problem)
         db.commit()
+        db.refresh(item)
         from ..problemlists import to_entry
 
         return to_entry(item, cache, None)
+
+    db.commit()
+    db.refresh(item)
 
     # 加完顺手把题目信息抓下来，列表里立刻能看到题名。
     cache = cached_problems(db, payload.platform, [key]).get(key)
@@ -566,6 +588,108 @@ def add_problem(
     from ..problemlists import to_entry
 
     return to_entry(item, cache, None)
+
+
+@router.post("/{list_id}/problems/batch", response_model=BatchProblemImportResult)
+def batch_add_problems(
+    list_id: int,
+    payload: BatchProblemImportRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_session),
+) -> BatchProblemImportResult:
+    """批量向题单导入多道题，返回成功添加与跳过原因列表。"""
+    problem_list = db.get(ProblemList, list_id)
+    if problem_list is None:
+        raise HTTPException(status_code=404, detail="题单不存在")
+    if problem_list.is_collection:
+        raise HTTPException(status_code=400, detail="合集里只能放题单，不能放题目")
+
+    existing_items = list(
+        db.exec(select(ProblemListItem).where(ProblemListItem.list_id == list_id)).all()
+    )
+    existing_keys = {(row.platform, row.key) for row in existing_items}
+    next_pos = max((row.position for row in existing_items), default=-1) + 1
+    current_count = len(existing_items)
+
+    from ..learning_helpers import learn_problem_or_400, upsert_learn_cache
+    from ..problemlists import to_entry
+
+    added_entries: list[ProblemEntry] = []
+    skipped: list[BatchProblemImportError] = []
+
+    for entry in payload.items:
+        key = normalize_key(entry.platform, entry.key)
+        if not key:
+            skipped.append(
+                BatchProblemImportError(
+                    platform=entry.platform, key=entry.key, detail="题号不能为空"
+                )
+            )
+            continue
+        if (entry.platform, key) in existing_keys:
+            skipped.append(
+                BatchProblemImportError(
+                    platform=entry.platform, key=key, detail="这道题已经在题单里了"
+                )
+            )
+            continue
+        if current_count >= MAX_PROBLEMS_PER_LIST:
+            skipped.append(
+                BatchProblemImportError(
+                    platform=entry.platform,
+                    key=key,
+                    detail=f"超过单题单上限（{MAX_PROBLEMS_PER_LIST} 题）",
+                )
+            )
+            continue
+
+        learn_problem = None
+        if entry.platform == Platform.LEARN:
+            try:
+                learn_problem = learn_problem_or_400(db, key)
+            except HTTPException as exc:
+                skipped.append(
+                    BatchProblemImportError(
+                        platform=entry.platform, key=key, detail=str(exc.detail)
+                    )
+                )
+                continue
+
+        item = ProblemListItem(
+            list_id=list_id,
+            platform=entry.platform,
+            key=key,
+            position=next_pos,
+            note=entry.note,
+            created_at=utcnow(),
+        )
+        db.add(item)
+        if entry.platform == Platform.LEARN and learn_problem is not None:
+            cache = upsert_learn_cache(db, learn_problem)
+            db.commit()
+            db.refresh(item)
+        else:
+            db.commit()
+            db.refresh(item)
+            cache = cached_problems(db, entry.platform, [key]).get(key)
+            if cache is None:
+                info = _fetch_and_cache(db, entry.platform, key)
+                cache = ProblemCache(
+                    platform=entry.platform,
+                    key=key,
+                    name=info.name,
+                    rating=info.rating,
+                    tags_json=json.dumps(info.tags, ensure_ascii=False),
+                    url=info.url,
+                    missing_reason=info.missing_reason,
+                )
+
+        existing_keys.add((entry.platform, key))
+        next_pos += 1
+        current_count += 1
+        added_entries.append(to_entry(item, cache, None))
+
+    return BatchProblemImportResult(added=added_entries, skipped=skipped)
 
 
 @router.patch("/{list_id}/problems/{item_id}", response_model=ProblemEntry)
@@ -618,10 +742,22 @@ def reorder_problems(
     if problem_list is None:
         raise HTTPException(status_code=404, detail="题单不存在")
 
+    if len(set(payload.ids)) != len(payload.ids):
+        raise HTTPException(status_code=400, detail="排序列表中包含重复的题目 ID")
+    existing = {
+        row.id: row
+        for row in db.exec(
+            select(ProblemListItem).where(
+                ProblemListItem.list_id == list_id,
+                ProblemListItem.id.in_(payload.ids),  # type: ignore[attr-defined]
+            )
+        ).all()
+    }
+    if len(existing) != len(payload.ids):
+        raise HTTPException(status_code=400, detail="排序列表包含不属于该题单的题目")
+
     for index, item_id in enumerate(payload.ids):
-        item = db.get(ProblemListItem, item_id)
-        if item is None or item.list_id != list_id:
-            continue
+        item = existing[item_id]
         item.position = index
         db.add(item)
     db.commit()
