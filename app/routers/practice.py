@@ -167,7 +167,7 @@ def build_practice_rank(
         if account is None:
             continue
         user = users.get(account.user_id)
-        if user is None or user.is_external:
+        if user is None or user.is_external or user.status == UserStatus.PENDING:
             continue
         if not include_retired and user.status != UserStatus.ACTIVE:
             continue
@@ -443,7 +443,7 @@ def rating_board(
     entries: list[RatingEntry] = []
     for account in accounts:
         user = users.get(account.user_id)
-        if user is None or user.is_external:
+        if user is None or user.is_external or user.status == UserStatus.PENDING:
             continue
         if not include_retired and user.status != UserStatus.ACTIVE:
             continue

@@ -29,12 +29,16 @@ from .models import (
     InviteUse,
     LoginTicket,
     NotificationRead,
+    OAuthAccessToken,
+    OAuthAuthCode,
+    OAuthClient,
     PasskeyCredential,
     Post,
     ProblemList,
     PushDispatch,
     PushSubscription,
     RefreshQuota,
+    ReviewRequest,
     Role,
     Signup,
     SignupEntry,
@@ -105,6 +109,15 @@ def delete_user_references(
     for plist in db.exec(select(ProblemList).where(ProblemList.created_by == user_id)).all():
         plist.created_by = None
         db.add(plist)
+    for client in db.exec(select(OAuthClient).where(OAuthClient.created_by == user_id)).all():
+        client.created_by = None
+        db.add(client)
+    for review in db.exec(select(ReviewRequest).where(ReviewRequest.user_id == user_id)).all():
+        review.user_id = None
+        db.add(review)
+    for review in db.exec(select(ReviewRequest).where(ReviewRequest.reviewed_by == user_id)).all():
+        review.reviewed_by = None
+        db.add(review)
 
     # 非空创建者/作者外键（文章、集训、报名、状态覆盖）转移给操作管理员或 root，保留历史内容。
     target_owner = (
@@ -142,6 +155,8 @@ def delete_user_references(
         RefreshQuota,
         CampRegistration,
         NotificationRead,
+        OAuthAuthCode,
+        OAuthAccessToken,
     ):
         for row in db.exec(select(model).where(model.user_id == user_id)).all():
             db.delete(row)

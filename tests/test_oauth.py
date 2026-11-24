@@ -17,6 +17,8 @@ from app.main import create_app
 from app.models import Account, OAuthAuthCode, Platform, User, utcnow
 from app.routers import auth as auth_router
 
+from .conftest import approve_registration
+
 ROOT_STUDENT_ID = "00000000000"
 ROOT_PASSWORD = "devpassword123"
 MEMBER_STUDENT_ID = "24125023001"
@@ -77,11 +79,17 @@ def member_client(app, root_client):
             },
         )
         assert resp.status_code == 201
+        approve_registration(root_client, MEMBER_STUDENT_ID)
+        login = c.post(
+            "/api/auth/login",
+            json={"student_id": MEMBER_STUDENT_ID, "password": MEMBER_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
         yield c
 
 
 @pytest.fixture()
-def external_client(app):
+def external_client(app, root_client):
     with TestClient(app) as c:
         resp = c.post(
             "/api/auth/register-external",
@@ -92,6 +100,12 @@ def external_client(app):
             },
         )
         assert resp.status_code == 201
+        approve_registration(root_client, "guest_alice")
+        login = c.post(
+            "/api/auth/login",
+            json={"student_id": "guest_alice", "password": "guestpassword123"},
+        )
+        assert login.status_code == 200, login.text
         yield c
 
 

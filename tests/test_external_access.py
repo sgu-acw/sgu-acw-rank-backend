@@ -26,6 +26,8 @@ from app.models import (
 )
 from app.routers import auth as auth_router
 
+from .conftest import approve_registration
+
 ROOT_STUDENT_ID = "00000000000"
 ROOT_PASSWORD = "devpassword123"
 MEMBER_STUDENT_ID = "24125023001"
@@ -92,6 +94,12 @@ def member_client(app, root_client):
             },
         )
         assert resp.status_code == 201
+        approve_registration(root_client, MEMBER_STUDENT_ID)
+        login = c.post(
+            "/api/auth/login",
+            json={"student_id": MEMBER_STUDENT_ID, "password": MEMBER_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
         yield c
 
 
@@ -164,8 +172,8 @@ def _register_external(
     )
 
 
-def test_external_registration_login_and_profile_hygiene(app, client):
-    """校外自助注册无需学号与邀请码，自动归一化小写并隐藏校内学籍字段。"""
+def test_external_registration_login_and_profile_hygiene(app, client, root_client):
+    """校外自助注册无需学号与邀请码，自动归一化小写并隐藏校内学籍字段，审核通过后可登录。"""
     resp = _register_external(client, username="Alice_ACM", display_name="小艾")
     assert resp.status_code == 201, resp.text
     me = resp.json()
@@ -177,9 +185,33 @@ def test_external_registration_login_and_profile_hygiene(app, client):
     assert me["major_name"] is None
     assert me["class_label"] is None
 
-    # 注册即自动登录，可管理自己的昵称和会话
+    # 审核前不发放会话且不可登录
+    assert client.get("/api/auth/me").status_code == 401
+    pending_login = client.post(
+        "/api/auth/login",
+        json={"student_id": "ALICE_ACM", "password": "ExternalPass123!"},
+    )
+    assert pending_login.status_code == 403
+    assert "审核" in pending_login.json()["detail"]
+
+    # 管理员审核通过后可登录（大小写不敏感）并管理会话，改名需走资料修改审核
+    approve_registration(root_client, "alice_acm")
+    login = client.post(
+        "/api/auth/login",
+        json={"student_id": "ALICE_ACM", "password": "ExternalPass123!"},
+    )
+    assert login.status_code == 200, login.text
     assert client.get("/api/auth/me").json()["student_id"] == "alice_acm"
-    assert client.patch("/api/auth/me", json={"display_name": "小艾改名"}).status_code == 200
+    assert client.patch("/api/auth/me", json={"display_name": "小艾改名"}).status_code == 403
+    req = client.post(
+        "/api/auth/me/change-requests",
+        json={"display_name": "小艾改名", "reason": "更正昵称"},
+    )
+    assert req.status_code == 201, req.text
+    assert (
+        root_client.post(f"/api/admin/reviews/{req.json()['id']}/approve", json={}).status_code
+        == 200
+    )
     assert len(client.get("/api/auth/sessions").json()) == 1
 
     # 登出后用不同大小写用户名重新登录
@@ -229,6 +261,14 @@ def test_three_tier_visibility_matrix(app, client, member_client, root_client, d
         ext_resp = _register_external(ext_client, username="outsider01", display_name="校外访客")
         assert ext_resp.status_code == 201
         ext_id = ext_resp.json()["id"]
+        approve_registration(root_client, "outsider01")
+        assert (
+            ext_client.post(
+                "/api/auth/login",
+                json={"student_id": "outsider01", "password": "ExternalPass123!"},
+            ).status_code
+            == 200
+        )
 
         # 1. 公开内容三方都可读
         for c in (client, ext_client, member_client):
@@ -337,6 +377,14 @@ def test_external_user_can_save_learning_runs_and_admin_safeguards(app, root_cli
 
     with TestClient(app) as ext_client:
         ext = _register_external(ext_client, username="learner01", display_name="外部刷题者").json()
+        approve_registration(root_client, "learner01")
+        assert (
+            ext_client.post(
+                "/api/auth/login",
+                json={"student_id": "learner01", "password": "ExternalPass123!"},
+            ).status_code
+            == 200
+        )
 
         run_id = str(uuid4())
         run_resp = ext_client.post(
@@ -362,13 +410,9 @@ def test_external_user_can_save_learning_runs_and_admin_safeguards(app, root_cli
         bad_invite = root_client.post("/api/admin/invites", json={"grants_role": Role.EXTERNAL})
         assert bad_invite.status_code == 422
 
-        role_patch = root_client.patch(
-            f"/api/admin/users/{ext['id']}", json={"role": Role.MEMBER}
-        )
+        role_patch = root_client.patch(f"/api/admin/users/{ext['id']}", json={"role": Role.MEMBER})
         assert role_patch.status_code == 400
-        post_patch = root_client.patch(
-            f"/api/admin/users/{ext['id']}", json={"can_post": True}
-        )
+        post_patch = root_client.patch(f"/api/admin/users/{ext['id']}", json={"can_post": True})
         assert post_patch.status_code == 400
 
         # 管理员可以按角色筛选校外账号、查看统计中的 external_count、停用与删除

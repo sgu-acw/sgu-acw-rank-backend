@@ -40,6 +40,7 @@ from .routers import (
     practice,
     problemlists,
     push,
+    reviews,
     signups,
     users,
     webauthn,
@@ -177,6 +178,7 @@ def create_app() -> FastAPI:
     app.include_router(signups.router, prefix=API_PREFIX)
     app.include_router(webauthn.router, prefix=API_PREFIX)
     app.include_router(oauth.router, prefix=API_PREFIX)
+    app.include_router(reviews.router, prefix=API_PREFIX)
     # 题库：题目/版本/提交记录。表由 init_db 的 create_all 建立。
     app.include_router(learning.router, prefix=API_PREFIX)
 

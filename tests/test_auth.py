@@ -12,6 +12,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+from .conftest import approve_all_registrations, approve_registration
+
 ROOT_STUDENT_ID = "24125023005"
 ROOT_PASSWORD = "rootpassword123"
 
@@ -87,6 +89,25 @@ def _register(
     )
 
 
+def _register_and_login(
+    client: TestClient,
+    root_client: TestClient,
+    code: str,
+    student_id: str = MEMBER_STUDENT_ID,
+    password: str = MEMBER_PASSWORD,
+) -> dict:
+    """注册、通过管理员审核并登录到 ``client``，返回注册响应里的用户信息。"""
+    resp = _register(client, code, student_id=student_id, password=password)
+    assert resp.status_code == 201, resp.text
+    approve_registration(root_client, student_id)
+    login = client.post(
+        "/api/auth/login",
+        json={"student_id": student_id, "password": password},
+    )
+    assert login.status_code == 200, login.text
+    return resp.json()
+
+
 # --------------------------------------------------------------------------- #
 # Registration
 # --------------------------------------------------------------------------- #
@@ -109,12 +130,31 @@ def test_register_with_valid_invite(client, root_client):
     assert "password_hash" not in body
 
 
-def test_register_sets_session_cookie(client, root_client):
+def test_register_does_not_issue_session_before_review(client, root_client):
+    """注册只建待审核账号，不发会话；会话要等管理员通过后登录才拿到。"""
     invite = _make_invite(root_client)
     response = _register(client, invite["code"])
-    assert response.cookies.get("sgu_acw_session")
+    assert response.status_code == 201
+    assert not response.cookies.get("sgu_acw_session")
+    assert "set-cookie" not in response.headers
+
+    assert client.get("/api/auth/me").status_code == 401
+    pending = client.post(
+        "/api/auth/login",
+        json={"student_id": MEMBER_STUDENT_ID, "password": MEMBER_PASSWORD},
+    )
+    assert pending.status_code == 403
+    assert "审核" in pending.json()["detail"]
+
+    approve_registration(root_client, MEMBER_STUDENT_ID)
+    login = client.post(
+        "/api/auth/login",
+        json={"student_id": MEMBER_STUDENT_ID, "password": MEMBER_PASSWORD},
+    )
+    assert login.status_code == 200, login.text
+    assert client.cookies.get("sgu_acw_session")
     # The session cookie must not be readable from JavaScript.
-    set_cookie = response.headers["set-cookie"]
+    set_cookie = login.headers["set-cookie"]
     assert "HttpOnly" in set_cookie
     assert "samesite=lax" in set_cookie.lower()
 
@@ -195,6 +235,7 @@ def test_revoked_invite_is_rejected(client, root_client):
 def test_login_and_me(client, root_client):
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
 
     fresh = TestClient(client.app)
     assert fresh.get("/api/auth/me").status_code == 401
@@ -257,6 +298,7 @@ def test_logout_is_idempotent(client):
 def test_disabled_account_cannot_log_in(client, root_client):
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
     members = _members(root_client)
     member = next(m for m in members if m["student_id"] == MEMBER_STUDENT_ID)
 
@@ -288,7 +330,7 @@ def test_update_own_display_name(client):
 
 def test_member_cannot_change_own_role(client, root_client):
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     # The schema has no role field, so it is ignored rather than applied.
     response = client.patch("/api/auth/me", json={"role": "admin"})
     assert response.status_code == 200
@@ -297,7 +339,7 @@ def test_member_cannot_change_own_role(client, root_client):
 
 def test_change_password_keeps_caller_logged_in_and_evicts_others(client, root_client):
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
 
     other = TestClient(client.app)
     other.post(
@@ -346,7 +388,7 @@ def test_change_password_requires_current_password(client):
 
 def test_member_cannot_reach_admin_endpoints(client, root_client):
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     assert client.get("/api/admin/users").status_code == 403
     assert client.get("/api/admin/invites").status_code == 403
     assert client.post("/api/admin/invites", json={"max_uses": 1}).status_code == 403
@@ -354,7 +396,7 @@ def test_member_cannot_reach_admin_endpoints(client, root_client):
 
 def test_admin_note_is_writable_by_admin_and_hidden_from_members(client, root_client):
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     members = _members(root_client)
     member = next(m for m in members if m["student_id"] == MEMBER_STUDENT_ID)
 
@@ -394,6 +436,7 @@ def test_admin_cannot_promote_to_admin(client, root_client):
     """Only root hands out administrative roles."""
     invite = _make_invite(root_client, grants_role="admin")
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
 
     # The promoted account is an admin; it must not be able to promote further.
     admin_client = TestClient(client.app)
@@ -432,6 +475,7 @@ def test_root_cannot_be_demoted_or_disabled(client, root_client):
 def test_reset_password_returns_temporary_and_invalidates_old(client, root_client):
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
     members = _members(root_client)
     member = next(m for m in members if m["student_id"] == MEMBER_STUDENT_ID)
 
@@ -478,6 +522,7 @@ def test_directory_requires_login(client):
 def test_directory_lists_active_members(client, root_client):
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
     entries = root_client.get("/api/users").json()
     assert {e["student_id"] for e in entries} == {ROOT_STUDENT_ID, MEMBER_STUDENT_ID}
     assert all("admin_note" not in e for e in entries)
@@ -486,6 +531,7 @@ def test_directory_lists_active_members(client, root_client):
 def test_disabled_members_are_hidden_from_the_directory(client, root_client):
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
     members = _members(root_client)
     member = next(m for m in members if m["student_id"] == MEMBER_STUDENT_ID)
     root_client.patch(f"/api/admin/users/{member['id']}", json={"status": "disabled"})
@@ -557,6 +603,7 @@ def test_session_endpoint_returns_user_when_logged_in(client):
 def test_session_endpoint_ignores_a_disabled_account(client, root_client):
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
     members = _members(root_client)
     member = next(m for m in members if m["student_id"] == MEMBER_STUDENT_ID)
     root_client.patch(f"/api/admin/users/{member['id']}", json={"status": "disabled"})
@@ -581,6 +628,7 @@ def _seed_members(client, root_client, count=3):
             password="password12345",
         )
         created.append(response.json())
+    approve_all_registrations(root_client)
     return created
 
 
@@ -731,7 +779,14 @@ def test_delete_user_removes_accounts_and_sessions(client, root_client):
     _seed_members(client, root_client, 1)
     member = next(u for u in _members(root_client) if u["role"] == "member")
 
-    # 成员当前是登录状态（注册时种了 cookie）。
+    # 审核通过后先登录成员端。
+    assert (
+        client.post(
+            "/api/auth/login",
+            json={"student_id": member["student_id"], "password": "password12345"},
+        ).status_code
+        == 200
+    )
     assert client.get("/api/auth/me").status_code == 200
 
     assert root_client.delete(f"/api/admin/users/{member['id']}").status_code == 204
@@ -750,6 +805,7 @@ def test_cannot_delete_root_by_other_admin(client, root_client):
     _seed_members(client, root_client, 1)
     invite = _make_invite(root_client, grants_role="admin")
     _register(client, invite["code"], student_id="25125023099", password="password12345")
+    approve_all_registrations(root_client)
 
     admin_client = TestClient(client.app)
     admin_client.post(
@@ -800,7 +856,7 @@ def test_unbinding_account_removes_its_progress(client, root_client):
     from app.platforms import Profile
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
 
     with patch(
         "app.routers.accounts.fetch_profile",
@@ -834,7 +890,7 @@ def test_manual_refresh_quota(client, root_client):
     from unittest.mock import patch
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
 
     with patch(
         "app.routers.accounts.fetch_profile",
@@ -972,7 +1028,7 @@ def test_verify_is_rate_limited(client, root_client):
     from unittest.mock import patch
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     account_id = _bind_account(client)
 
     with patch(
@@ -1001,7 +1057,7 @@ def test_verify_cooldown_grows_with_attempts(client, root_client):
 
     settings = get_settings()
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     account_id = _bind_account(client)
 
     with Session(get_engine()) as db:
@@ -1039,7 +1095,7 @@ def test_successful_verify_resets_counter(client, root_client):
     from app.models import Account
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     account_id = _bind_account(client)
 
     with patch("app.routers.accounts.check_signature", return_value=(True, "验证通过")):
@@ -1058,7 +1114,7 @@ def test_renew_does_not_reset_cooldown(client, root_client):
     from unittest.mock import patch
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     account_id = _bind_account(client)
 
     with patch("app.routers.accounts.check_signature", return_value=(False, "没找到")):
@@ -1077,7 +1133,7 @@ def test_verified_account_is_not_rate_limited(client, root_client):
     from unittest.mock import patch
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"])
+    _register_and_login(client, root_client, invite["code"])
     account_id = _bind_account(client)
 
     with patch("app.routers.accounts.check_signature", return_value=(True, "验证通过")):
@@ -1101,7 +1157,7 @@ def test_college_and_major_names_resolved_from_codes(client, root_client):
     码表来自学号规则反推，放在 app/academic.py。
     """
     invite = _make_invite(root_client)
-    _register(client, invite["code"])  # 25125023001 → 学院 25 / 专业 02
+    _register_and_login(client, root_client, invite["code"])  # 25125023001 → 学院 25 / 专业 02
 
     me = client.get("/api/auth/me").json()
     assert me["college_code"] == "25"
@@ -1189,7 +1245,7 @@ def test_rating_board_shows_college_and_class(client, root_client):
     from app.platforms import Profile
 
     invite = _make_invite(root_client)
-    _register(client, invite["code"], student_id="25125023003")
+    _register_and_login(client, root_client, invite["code"], student_id="25125023003")
 
     with patch(
         "app.routers.accounts.fetch_profile",
@@ -1227,6 +1283,7 @@ def _make_admin(client, root_client, student_id="25125023010") -> TestClient:
 
     invite = _make_invite(root_client, grants_role="admin")
     _register(client, invite["code"], student_id=student_id)
+    approve_all_registrations(root_client)
 
     admin = TestClient(create_app())
     response = admin.post(
@@ -1267,6 +1324,7 @@ def test_admin_can_promote_member(client, root_client):
     """管理员能把成员提成管理员。"""
     invite = _make_invite(root_client)
     _register(client, invite["code"], student_id="25125023011")
+    approve_all_registrations(root_client)
 
     admin = _make_admin(client, root_client)
     target = next(u for u in _members(admin) if u["student_id"] == "25125023011")
@@ -1383,7 +1441,7 @@ def test_admin_member_detail_lists_account_health(client, root_client):
     from app.platforms import Profile
 
     invite = _make_invite(root_client)
-    created = _register(client, invite["code"], student_id="25125023021").json()
+    created = _register_and_login(client, root_client, invite["code"], student_id="25125023021")
 
     with patch(
         "app.routers.accounts.fetch_profile",
@@ -1421,6 +1479,7 @@ def test_member_cannot_read_admin_detail(client, root_client):
 
     invite = _make_invite(root_client)
     created = _register(client, invite["code"], student_id="25125023022").json()
+    approve_registration(root_client, "25125023022")
 
     member = TestClient(create_app())
     member.post(
@@ -1455,6 +1514,7 @@ def test_admin_user_list_includes_accounts(client, root_client):
     # 建一个成员，然后直接往库里塞账号（绕开绑定流程，这里只关心列表输出）。
     invite = _make_invite(root_client)
     _register(client, invite["code"])
+    approve_all_registrations(root_client)
 
     with Session(get_engine()) as db:
         user = db.exec(select(User).where(User.student_id == MEMBER_STUDENT_ID)).first()

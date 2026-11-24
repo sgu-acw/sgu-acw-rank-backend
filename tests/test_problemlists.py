@@ -8,6 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
+from .conftest import approve_registration
+
 ROOT_STUDENT_ID = "00000000000"
 ROOT_PASSWORD = "devpassword123"
 MEMBER_STUDENT_ID = "24125023001"
@@ -64,7 +66,7 @@ def member_client(env, root_client):
     # 盖掉调用方原来的登录状态。用 root_client 去注册的话，root 会当场
     # 变成刚注册的成员，后面的请求全部 403。
     c = TestClient(create_app())
-    c.post(
+    reg = c.post(
         "/api/auth/register",
         json={
             "invite_code": invite["code"],
@@ -73,6 +75,8 @@ def member_client(env, root_client):
             "password": MEMBER_PASSWORD,
         },
     )
+    assert reg.status_code == 201, reg.text
+    approve_registration(root_client, MEMBER_STUDENT_ID)
 
     response = c.post(
         "/api/auth/login",

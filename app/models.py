@@ -10,6 +10,7 @@ annotations``. Postponed evaluation turns the ``Relationship`` annotations into
 plain strings, which SQLModel cannot resolve back to the related class.
 """
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from typing import ClassVar
 
@@ -45,6 +46,29 @@ class Role:
 class UserStatus:
     ACTIVE = "active"
     DISABLED = "disabled"
+    PENDING = "pending"
+
+    ALL = (ACTIVE, DISABLED, PENDING)
+
+
+class ReviewKind:
+    """需要管理员审核的申请类型。"""
+
+    REGISTRATION = "registration"
+    PROFILE_CHANGE = "profile_change"
+
+    ALL = (REGISTRATION, PROFILE_CHANGE)
+
+
+class ReviewStatus:
+    """审核单状态。"""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+    ALL = (PENDING, APPROVED, REJECTED, CANCELLED)
 
 
 class ProblemListKind:
@@ -194,6 +218,17 @@ class User(SQLModel, table=True):
     @property
     def is_active(self) -> bool:
         return self.status == UserStatus.ACTIVE
+
+    @property
+    def former_names(self) -> list[str]:
+        """曾用名列表（按记录顺序去重）。"""
+        try:
+            raw = json.loads(self.former_names_json or "[]")
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, str) and item.strip()]
 
 
 class Invite(SQLModel, table=True):
@@ -1204,3 +1239,40 @@ class OAuthAccessToken(SQLModel, table=True):
     expires_at: datetime = Field(index=True)
     revoked_at: datetime | None = None
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class ReviewRequest(SQLModel, table=True):
+    """统一审核单：覆盖新用户注册审核与成员改名/更改资料审核。
+
+    设计上保留提交时快照（``student_id``、``current_display_name``、
+    ``before_json``、``after_json``），即使注册申请被驳回并释放了占位账号，
+    管理员依然能追溯完整的申请与审核记录。
+    """
+
+    __tablename__ = "review_requests"
+
+    id: int | None = Field(default=None, primary_key=True)
+    #: registration / profile_change
+    kind: str = Field(max_length=32, index=True)
+    #: pending / approved / rejected / cancelled
+    status: str = Field(default=ReviewStatus.PENDING, max_length=16, index=True)
+
+    user_id: int | None = Field(default=None, foreign_key="users.id", index=True)
+    student_id: str = Field(max_length=16, index=True)
+    current_display_name: str = Field(default="", max_length=64)
+    role: str = Field(default=Role.MEMBER, max_length=16)
+    invite_code: str | None = Field(default=None, max_length=32)
+
+    #: 变更前快照 JSON；注册申请为空对象 {}。
+    before_json: str = Field(default="{}")
+    #: 申请的新值 JSON（或注册信息快照）。
+    after_json: str = Field(default="{}")
+
+    #: 申请人填写的说明（可选）。
+    reason: str = Field(default="", max_length=300)
+    #: 管理员审批意见（可选）。
+    review_note: str = Field(default="", max_length=300)
+    reviewed_by: int | None = Field(default=None, foreign_key="users.id", index=True)
+
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    reviewed_at: datetime | None = None

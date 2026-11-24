@@ -127,6 +127,8 @@ def login_complete(
     db: Session = Depends(get_session),
 ) -> dict:
     user, _cred = webauthn_flow.finish_login(db, payload.challenge, payload.credential)
+    if user.status == UserStatus.PENDING:
+        raise HTTPException(status_code=403, detail="账号正在等待管理员审核，审核通过后即可登录")
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="账号已停用")
 

@@ -28,12 +28,19 @@ from ..models import (
     Invite,
     ProblemCache,
     PushSubscription,
+    ReviewRequest,
+    ReviewStatus,
     Role,
     SolvedSnapshot,
     User,
     UserSession,
     UserStatus,
     utcnow,
+)
+from ..reviews import (
+    apply_display_name_change,
+    cancel_pending_reviews_for_user,
+    complete_registration_reviews_for_user,
 )
 from ..schemas import (
     AcademicOptions,
@@ -178,10 +185,14 @@ def list_users(
     statement = select(User)
 
     if q and q.strip():
-        # 学号按前缀匹配，姓名按包含匹配：学号输一半也能搜到。
+        # 学号按前缀匹配，姓名和曾用名按包含匹配：学号输一半或查旧名字都能搜到。
         needle = q.strip()
         statement = statement.where(
-            or_(User.student_id.startswith(needle), User.display_name.contains(needle))  # type: ignore[union-attr]
+            or_(
+                User.student_id.startswith(needle),  # type: ignore[union-attr]
+                User.display_name.contains(needle),  # type: ignore[union-attr]
+                User.former_names_json.contains(needle),  # type: ignore[union-attr]
+            )
         )
 
     if role:
@@ -376,17 +387,20 @@ def update_user(
             raise HTTPException(status_code=403, detail="不能停用 root")
         if user.id == admin.id and payload.status == UserStatus.DISABLED:
             raise HTTPException(status_code=400, detail="不能停用自己")
+        was_pending = user.status == UserStatus.PENDING
         user.status = payload.status
         if payload.status == UserStatus.DISABLED:
             # A disabled account should not keep working sessions around.
             for row in db.exec(select(UserSession).where(UserSession.user_id == user.id)).all():
                 db.delete(row)
+        elif was_pending and payload.status == UserStatus.ACTIVE:
+            complete_registration_reviews_for_user(db, user, admin)
 
     if payload.admin_note is not None:
         user.admin_note = payload.admin_note
 
     if payload.display_name is not None:
-        user.display_name = payload.display_name
+        apply_display_name_change(user, payload.display_name)
 
     if payload.can_post is not None:
         if user.is_external and payload.can_post:
@@ -430,6 +444,7 @@ def delete_user(
 
     # 会话、账号、以及指向该成员的其他记录都要一起清掉。漏掉任何一张带
     # 外键的表，删除都会被数据库拦下。
+    cancel_pending_reviews_for_user(db, user, admin)
     for row in db.exec(select(UserSession).where(UserSession.user_id == user.id)).all():
         db.delete(row)
     delete_user_accounts(db, user.id)
@@ -502,6 +517,14 @@ def stats(db: Session = Depends(get_session)) -> dict:
     externals = db.exec(
         select(func.count()).select_from(User).where(User.role == Role.EXTERNAL)
     ).one()
+    pending_users = db.exec(
+        select(func.count()).select_from(User).where(User.status == UserStatus.PENDING)
+    ).one()
+    pending_reviews = db.exec(
+        select(func.count())
+        .select_from(ReviewRequest)
+        .where(ReviewRequest.status == ReviewStatus.PENDING)
+    ).one()
     now = utcnow()
     live_invites = db.exec(
         select(func.count())
@@ -520,6 +543,8 @@ def stats(db: Session = Depends(get_session)) -> dict:
         "active_count": int(active),
         "admin_count": int(admins),
         "external_count": int(externals),
+        "pending_user_count": int(pending_users),
+        "pending_review_count": int(pending_reviews),
         "usable_invite_count": int(live_invites),
         "push_subscriber_count": int(push_users),
         "push_device_count": int(push_devices),
@@ -636,6 +661,7 @@ def get_member_detail(
         role=user.role,
         status=user.status,
         admin_note=user.admin_note,
+        former_names=user.former_names,
         last_login_at=user.last_login_at,
         created_at=user.created_at,
         accounts=details,

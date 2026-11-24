@@ -37,6 +37,8 @@ def list_members(
     statement = select(User).where(User.role != Role.EXTERNAL)
     if not include_disabled or not _current.is_admin:
         statement = statement.where(User.status == UserStatus.ACTIVE)
+    else:
+        statement = statement.where(User.status != UserStatus.PENDING)
     statement = statement.order_by(User.enroll_year.desc(), User.student_id)  # type: ignore[attr-defined]
     return list(db.exec(statement).all())
 
@@ -48,6 +50,8 @@ def get_member(
     db: Session = Depends(get_session),
 ) -> User:
     user = db.get(User, user_id)
-    if user is None or user.is_external:
+    if user is None or user.is_external or (
+        user.status == UserStatus.PENDING and not _current.is_admin
+    ):
         raise HTTPException(status_code=404, detail="成员不存在")
     return user

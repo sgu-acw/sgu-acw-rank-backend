@@ -69,6 +69,8 @@ class UserAdmin(UserPublic):
     last_login_at: datetime | None = None
     #: 能不能发文章（博客/公告）。管理员天然能，这里表示成员被勾了没有。
     can_post: bool = False
+    #: 曾用名列表（改名自动归档，便于追责与荣誉核验）。
+    former_names: list[str] = Field(default_factory=list)
 
     #: 这个成员绑定的平台账号。列表页直接显示，不用再点进详情。
     accounts: list[AdminAccountBrief] = Field(default_factory=list)
@@ -696,6 +698,8 @@ class AdminMemberDetail(BaseModel):
 
     #: 仅管理员可见的备注。
     admin_note: str = ""
+    #: 曾用名列表（改名自动归档）。
+    former_names: list[str] = Field(default_factory=list)
     last_login_at: datetime | None = None
     created_at: datetime
 
@@ -737,3 +741,73 @@ class ProblemListRank(BaseModel):
     title: str
     total: int
     entries: list[ProblemListRankEntry] = Field(default_factory=list)
+
+
+class CreateProfileChangeRequest(BaseModel):
+    """成员提交的改名 / 更改个人资料申请（需管理员审核）。"""
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=32)
+    college_override: str | None = Field(default=None, max_length=64)
+    major_override: str | None = Field(default=None, max_length=64)
+    class_no: int | None = Field(default=None, ge=0, le=99)
+    reason: str = Field(default="", max_length=300)
+
+    @field_validator("display_name")
+    @classmethod
+    def _strip_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("姓名不能为空")
+        return cleaned
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class ReviewDecisionRequest(BaseModel):
+    """管理员审批（通过/驳回）时附带的备注。"""
+
+    review_note: str = Field(default="", max_length=300)
+
+    @field_validator("review_note")
+    @classmethod
+    def _strip_note(cls, value: str) -> str:
+        return value.strip()
+
+
+class ReviewRequestPublic(BaseModel):
+    """单条审核申请（供成员查看自己的记录，以及管理员审批）。"""
+
+    id: int
+    kind: str
+    status: str
+    user_id: int | None = None
+    student_id: str
+    current_display_name: str
+    role: str
+    invite_code: str | None = None
+    before: dict[str, object] = Field(default_factory=dict)
+    after: dict[str, object] = Field(default_factory=dict)
+    reason: str = ""
+    review_note: str = ""
+    reviewed_by: int | None = None
+    reviewer_name: str | None = None
+    reviewer_student_id: str | None = None
+    created_at: datetime
+    reviewed_at: datetime | None = None
+
+
+class AdminReviewPage(BaseModel):
+    """管理员审核列表分页响应。"""
+
+    items: list[ReviewRequestPublic] = Field(default_factory=list)
+    total: int
+    pending_count: int
+    pending_registration_count: int
+    pending_profile_change_count: int
+    page: int
+    page_size: int

@@ -68,6 +68,11 @@ def get_current_user(
     user = db.get(User, session_row.user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
+    if user.status == UserStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="账号正在等待管理员审核，审核通过后即可登录",
+        )
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已停用")
     return user

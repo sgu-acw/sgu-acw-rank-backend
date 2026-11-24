@@ -23,6 +23,7 @@ from ..config import get_settings
 from ..db import get_session
 from ..deps import get_current_session, get_current_user, get_optional_user, require_origin_secret
 from ..models import Invite, InviteUse, LoginTicket, Role, User, UserSession, UserStatus, utcnow
+from ..reviews import apply_display_name_change, create_registration_review
 from ..schemas import (
     ChangePasswordRequest,
     ExternalRegisterRequest,
@@ -298,7 +299,7 @@ def register(
             major_code=parsed.major_code,
             class_no=parsed.class_no,
             role=invite.grants_role,
-            status=UserStatus.ACTIVE,
+            status=UserStatus.PENDING,
             created_at=utcnow(),
         )
         db.add(user)
@@ -308,7 +309,8 @@ def register(
         # 转发到群外）光看次数查不出人来。
         db.add(InviteUse(invite_id=invite.id, user_id=user.id, used_at=utcnow()))
 
-        token = _issue_session(db, user, request)
+        # 注册进入管理员审核队列；未通过前不签发登录会话。
+        create_registration_review(db, user, invite_code=invite.code)
         db.commit()
     except HTTPException:
         db.rollback()
@@ -318,7 +320,6 @@ def register(
         raise
 
     db.refresh(user)
-    _set_session_cookie(response, token)
     return user
 
 
@@ -332,8 +333,9 @@ def register_external(
     """校外人员自助注册通道。
 
     无需邀请码与校内学号，使用自定义用户名（字母开头，3–16 位）创建
-    ``external`` 账号。该角色只开放题库练习、每日一题、题单浏览、博客与
-    荣誉殿堂等必要公开功能，无法查看校内成员名录、榜单、集训与报名信息。
+    ``external`` 账号，提交后进入管理员审核队列，通过后即可登录。
+    该角色只开放题库练习、每日一题、题单浏览、博客与荣誉殿堂等必要公开
+    功能，无法查看校内成员名录、榜单、集训与报名信息。
     """
     ip = _client_ip(request)
     _check_external_register_rate_limit(ip)
@@ -357,13 +359,13 @@ def register_external(
         major_code="",
         class_no=0,
         role=Role.EXTERNAL,
-        status=UserStatus.ACTIVE,
+        status=UserStatus.PENDING,
         created_at=utcnow(),
     )
     try:
         db.add(user)
         db.flush()
-        token = _issue_session(db, user, request)
+        create_registration_review(db, user)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -374,7 +376,6 @@ def register_external(
 
     _record_external_register(ip)
     db.refresh(user)
-    _set_session_cookie(response, token)
     return user
 
 
@@ -409,6 +410,8 @@ def login(
     if not verify_password(payload.password, user.password_hash):
         _record_login_failure(ip, student_id)
         raise HTTPException(status_code=401, detail="账号或密码错误")
+    if user.status == UserStatus.PENDING:
+        raise HTTPException(status_code=403, detail="账号正在等待管理员审核，审核通过后即可登录")
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="账号已停用")
 
@@ -474,6 +477,8 @@ def login_totp(
     user = db.get(User, uid, populate_existing=True)
     if user is None or not user.totp_secret or ticket.auth_fingerprint != _auth_fingerprint(user):
         raise HTTPException(status_code=401, detail="票据过期或无效，请重新登录")
+    if user.status == UserStatus.PENDING:
+        raise HTTPException(status_code=403, detail="账号正在等待管理员审核，审核通过后即可登录")
     if user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="账号已停用")
     totp = pyotp.TOTP(user.totp_secret)
@@ -644,8 +649,13 @@ def update_me(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> User:
-    if payload.display_name is not None:
-        user.display_name = payload.display_name
+    if payload.display_name is not None and payload.display_name != user.display_name:
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="修改姓名和个人资料需提交管理员审核，请通过资料修改申请提交",
+            )
+        apply_display_name_change(user, payload.display_name)
     db.add(user)
     db.commit()
     db.refresh(user)
