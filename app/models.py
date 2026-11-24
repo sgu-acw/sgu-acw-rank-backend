@@ -1140,3 +1140,67 @@ class WebAuthnChallenge(SQLModel, table=True):
     kind: str = "register"
     expires_at: datetime
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class OAuthClient(SQLModel, table=True):
+    """工作坊 OAuth 2.0 客户端注册表。
+
+    支持两类客户端：
+    - 机密客户端（如校赛管理服务器、监考后台）：持有 ``client_secret``，并可叠加 PKCE。
+    - 公开客户端（如纯桌面应用）：不持有密钥，强制要求 PKCE S256。
+    """
+
+    __tablename__ = "oauth_clients"
+
+    id: int | None = Field(default=None, primary_key=True)
+    client_id: str = Field(index=True, unique=True, max_length=64)
+    name: str = Field(max_length=100)
+    description: str = Field(default="", max_length=500)
+
+    #: 高熵随机 client_secret 的 SHA-256 哈希；公开客户端为 None。
+    client_secret_hash: str | None = Field(default=None, max_length=64)
+    is_public: bool = Field(default=False)
+    #: 默认仅允许校内成员授权；为 False 时也允许校外账号使用该应用。
+    require_campus: bool = Field(default=True)
+
+    #: 允许的回调地址列表（JSON 数组）。loopback 回调若不带端口则按 RFC 8252 允许任意端口。
+    redirect_uris_json: str = "[]"
+    #: 允许申请的 scope 列表（JSON 数组），可选：profile、campus、nowcoder。
+    allowed_scopes_json: str = '["profile", "campus", "nowcoder"]'
+
+    is_active: bool = Field(default=True, index=True)
+    created_by: int | None = Field(default=None, foreign_key="users.id", index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class OAuthAuthCode(SQLModel, table=True):
+    """OAuth 2.0 一次性授权码（默认 60 秒过期，原子消费防重放）。"""
+
+    __tablename__ = "oauth_auth_codes"
+
+    id: int | None = Field(default=None, primary_key=True)
+    code_hash: str = Field(index=True, unique=True, max_length=64)
+    client_id: str = Field(index=True, max_length=64)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    redirect_uri: str = Field(max_length=512)
+    scope: str = Field(default="profile", max_length=256)
+    code_challenge: str | None = Field(default=None, max_length=128)
+    code_challenge_method: str | None = Field(default=None, max_length=16)
+    expires_at: datetime = Field(index=True)
+    used_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class OAuthAccessToken(SQLModel, table=True):
+    """短寿命 OAuth 访问令牌（仅用于获取用户信息，默认 1 小时过期）。"""
+
+    __tablename__ = "oauth_access_tokens"
+
+    id: int | None = Field(default=None, primary_key=True)
+    token_hash: str = Field(index=True, unique=True, max_length=64)
+    client_id: str = Field(index=True, max_length=64)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    scope: str = Field(default="profile", max_length=256)
+    expires_at: datetime = Field(index=True)
+    revoked_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utcnow)

@@ -35,6 +35,7 @@ from .routers import (
     learning,
     meta,
     notifications,
+    oauth,
     posts,
     practice,
     problemlists,
@@ -53,7 +54,18 @@ API_PREFIX = "/api"
 
 #: 校验失败时不能回显原值的字段。密码尤其不能——Pydantic 会把出错的原值
 #: 放进 ``input``，默认直接返回给客户端。
-SENSITIVE_FIELDS = frozenset({"password", "current_password", "new_password", "token"})
+SENSITIVE_FIELDS = frozenset(
+    {
+        "password",
+        "current_password",
+        "new_password",
+        "token",
+        "client_secret",
+        "code_verifier",
+        "code",
+        "access_token",
+    }
+)
 
 
 def bootstrap_root() -> None:
@@ -164,6 +176,7 @@ def create_app() -> FastAPI:
     app.include_router(push.router, prefix=API_PREFIX)
     app.include_router(signups.router, prefix=API_PREFIX)
     app.include_router(webauthn.router, prefix=API_PREFIX)
+    app.include_router(oauth.router, prefix=API_PREFIX)
     # 题库：题目/版本/提交记录。表由 init_db 的 create_all 建立。
     app.include_router(learning.router, prefix=API_PREFIX)
 
