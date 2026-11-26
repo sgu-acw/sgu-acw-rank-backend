@@ -58,6 +58,12 @@ from ..student_id import (
     parse_external_username,
     parse_student_id,
 )
+from .oauth import (
+    SCOPE_CATALOG,
+    QRAuthorizeRequest,
+    issue_authorization_code,
+    validate_qr_authorize_request,
+)
 
 router = APIRouter(
     prefix="/auth",
@@ -76,7 +82,14 @@ class QRLoginPollRequest(BaseModel):
 
 
 @router.post("/qr-login/begin")
-def begin_qr_login(db: Session = Depends(get_session)) -> dict[str, object]:
+def begin_qr_login(
+    response: Response,
+    oauth_request: QRAuthorizeRequest | None = None,
+    db: Session = Depends(get_session),
+) -> dict[str, object]:
+    if oauth_request is not None:
+        _, scopes = validate_qr_authorize_request(db, oauth_request)
+        oauth_request = oauth_request.model_copy(update={"scope": " ".join(scopes)})
     now = utcnow()
     db.exec(delete(QRLoginChallenge).where(QRLoginChallenge.expires_at <= now))
     challenge_id = secrets.token_urlsafe(24)
@@ -88,6 +101,7 @@ def begin_qr_login(db: Session = Depends(get_session)) -> dict[str, object]:
             id=challenge_id,
             approval_token_hash=hash_session_token(approval_token),
             poll_token_hash=hash_session_token(poll_token),
+            oauth_request_json=oauth_request.model_dump_json() if oauth_request else None,
             expires_at=expires_at,
         )
     )
@@ -96,6 +110,7 @@ def begin_qr_login(db: Session = Depends(get_session)) -> dict[str, object]:
     settings = get_settings()
     approval_url = f"{settings.rp_origin.rstrip('/')}/qr-login?token={approval_token}"
     image = qrcode.make(approval_url, image_factory=qrcode.image.svg.SvgPathImage)
+    response.headers["Cache-Control"] = "no-store"
     return {
         "challenge_id": challenge_id,
         "poll_token": poll_token,
@@ -104,28 +119,49 @@ def begin_qr_login(db: Session = Depends(get_session)) -> dict[str, object]:
     }
 
 
+def _pending_qr_approval(db: Session, token: str) -> QRLoginChallenge:
+    row = db.exec(
+        select(QRLoginChallenge).where(
+            QRLoginChallenge.approval_token_hash == hash_session_token(token),
+            QRLoginChallenge.status == "pending",
+            QRLoginChallenge.expires_at > utcnow(),
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=410, detail="二维码已过期或已使用")
+    return row
+
+
+@router.post("/qr-login/info")
+def qr_login_info(
+    payload: QRLoginApproveRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict:
+    row = _pending_qr_approval(db, payload.token)
+    if row.oauth_request_json is None:
+        return {"application": None}
+    oauth_request = QRAuthorizeRequest.model_validate_json(row.oauth_request_json)
+    client, scopes = validate_qr_authorize_request(db, oauth_request, user)
+    return {"application": client.name, "scopes": [SCOPE_CATALOG[key]["label"] for key in scopes]}
+
+
 @router.post("/qr-login/approve")
 def approve_qr_login(
     payload: QRLoginApproveRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict[str, str]:
-    now = utcnow()
-    row = db.exec(
-        select(QRLoginChallenge).where(
-            QRLoginChallenge.approval_token_hash == hash_session_token(payload.token),
-            QRLoginChallenge.status == "pending",
-            QRLoginChallenge.expires_at > now,
-        )
-    ).first()
-    if row is None:
-        raise HTTPException(status_code=410, detail="二维码已过期或已使用")
+    row = _pending_qr_approval(db, payload.token)
+    if row.oauth_request_json is not None:
+        oauth_request = QRAuthorizeRequest.model_validate_json(row.oauth_request_json)
+        validate_qr_authorize_request(db, oauth_request, user)
     result = db.exec(
         update(QRLoginChallenge)
         .where(
             QRLoginChallenge.id == row.id,
             QRLoginChallenge.status == "pending",
-            QRLoginChallenge.expires_at > now,
+            QRLoginChallenge.expires_at > utcnow(),
         )
         .values(status="approved", user_id=user.id)
     )
@@ -143,6 +179,7 @@ def poll_qr_login(
     db: Session = Depends(get_session),
 ) -> dict[str, str]:
     now = utcnow()
+    response.headers["Cache-Control"] = "no-store"
     row = db.exec(
         select(QRLoginChallenge).where(
             QRLoginChallenge.id == payload.challenge_id,
@@ -158,7 +195,11 @@ def poll_qr_login(
 
     result = db.exec(
         update(QRLoginChallenge)
-        .where(QRLoginChallenge.id == row.id, QRLoginChallenge.status == "approved")
+        .where(
+            QRLoginChallenge.id == row.id,
+            QRLoginChallenge.status == "approved",
+            QRLoginChallenge.expires_at > utcnow(),
+        )
         .values(status="consumed")
     )
     if result.rowcount != 1:
@@ -166,6 +207,20 @@ def poll_qr_login(
     user = db.get(User, row.user_id)
     if user is None or user.status != UserStatus.ACTIVE:
         raise HTTPException(status_code=403, detail="该账号当前不可登录")
+    if row.oauth_request_json is not None:
+        oauth_request = QRAuthorizeRequest.model_validate_json(row.oauth_request_json)
+        client, scopes = validate_qr_authorize_request(db, oauth_request, user)
+        code = issue_authorization_code(
+            db,
+            client=client,
+            user=user,
+            scopes=scopes,
+            redirect_uri=oauth_request.redirect_uri,
+            code_challenge=oauth_request.code_challenge,
+            code_challenge_method="S256",
+        )
+        db.commit()
+        return {"status": "authorized", "code": code}
     user.last_login_at = now
     token = _issue_session(db, user, request)
     _set_session_cookie(response, token)

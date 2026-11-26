@@ -1180,13 +1180,14 @@ class WebAuthnChallenge(SQLModel, table=True):
 
 
 class QRLoginChallenge(SQLModel, table=True):
-    """Short-lived phone approval for a browser login."""
+    """Short-lived phone approval for a browser login or an OAuth client."""
 
     __tablename__ = "qr_login_challenges"
 
     id: str = Field(primary_key=True, max_length=64)
     approval_token_hash: str = Field(max_length=64)
     poll_token_hash: str = Field(max_length=64, unique=True)
+    oauth_request_json: str | None = None
     status: str = Field(default="pending", max_length=16, index=True)
     user_id: int | None = Field(default=None, foreign_key="users.id", index=True)
     expires_at: datetime

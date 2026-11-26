@@ -361,6 +361,66 @@ class AuthorizeDecisionOut(BaseModel):
     expires_in: int | None = None
 
 
+class QRAuthorizeRequest(BaseModel):
+    client_id: str = Field(min_length=1, max_length=64)
+    redirect_uri: str = Field(min_length=1, max_length=512)
+    scope: str | None = Field(default=None, max_length=128)
+    code_challenge: str = Field(min_length=43, max_length=43)
+
+
+def validate_qr_authorize_request(
+    db: Session, body: QRAuthorizeRequest, user: User | None = None
+) -> tuple[OAuthClient, list[str]]:
+    client, scopes = _validate_authorize_request(
+        db,
+        client_id=body.client_id,
+        redirect_uri=body.redirect_uri,
+        scope=body.scope,
+        code_challenge=body.code_challenge,
+        code_challenge_method="S256",
+    )
+    redirect = urlsplit(body.redirect_uri)
+    if (
+        not client.is_public
+        or redirect.scheme != "http"
+        or redirect.hostname not in _LOOPBACK_HOSTS
+    ):
+        raise HTTPException(status_code=400, detail="该应用不支持客户端扫码登录")
+    if user is not None and client.require_campus and not user.is_campus_member:
+        raise HTTPException(status_code=403, detail="该应用仅限校内成员授权")
+    return client, scopes
+
+
+def issue_authorization_code(
+    db: Session,
+    *,
+    client: OAuthClient,
+    user: User,
+    scopes: list[str],
+    redirect_uri: str,
+    code_challenge: str | None,
+    code_challenge_method: str | None,
+) -> str:
+    now = utcnow()
+    db.exec(delete(OAuthAuthCode).where(OAuthAuthCode.expires_at < now))  # type: ignore[arg-type]
+    raw_code = new_session_token()
+    assert user.id is not None
+    db.add(
+        OAuthAuthCode(
+            code_hash=hash_session_token(raw_code),
+            client_id=client.client_id,
+            user_id=user.id,
+            redirect_uri=redirect_uri.strip(),
+            scope=" ".join(scopes),
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method if code_challenge else None,
+            expires_at=now + timedelta(seconds=AUTH_CODE_TTL_SECONDS),
+            created_at=now,
+        )
+    )
+    return raw_code
+
+
 @router.post("/oauth/authorize", response_model=AuthorizeDecisionOut)
 def authorize_decision(
     body: AuthorizeDecisionRequest,
@@ -394,24 +454,14 @@ def authorize_decision(
             detail="该应用仅限校内成员授权",
         )
 
-    now = utcnow()
-    # 顺带清理已过期的一次性授权码，避免表无限增长。
-    db.exec(delete(OAuthAuthCode).where(OAuthAuthCode.expires_at < now))  # type: ignore[arg-type]
-
-    raw_code = new_session_token()
-    assert user.id is not None
-    db.add(
-        OAuthAuthCode(
-            code_hash=hash_session_token(raw_code),
-            client_id=client.client_id,
-            user_id=user.id,
-            redirect_uri=body.redirect_uri.strip(),
-            scope=" ".join(scopes),
-            code_challenge=body.code_challenge,
-            code_challenge_method=body.code_challenge_method if body.code_challenge else None,
-            expires_at=now + timedelta(seconds=AUTH_CODE_TTL_SECONDS),
-            created_at=now,
-        )
+    raw_code = issue_authorization_code(
+        db,
+        client=client,
+        user=user,
+        scopes=scopes,
+        redirect_uri=body.redirect_uri,
+        code_challenge=body.code_challenge,
+        code_challenge_method=body.code_challenge_method,
     )
     db.commit()
 

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -107,6 +110,67 @@ def external_client(app, root_client):
         )
         assert login.status_code == 200, login.text
         yield c
+
+
+def test_desktop_qr_approval_issues_only_one_pkce_authorization_code(app, root_client):
+    redirect = "http://127.0.0.1/callback"
+    desktop = TestClient(app)
+    created = root_client.post(
+        "/api/admin/oauth/clients",
+        json={
+            "name": "校赛客户端",
+            "redirect_uris": [redirect],
+            "allowed_scopes": ["profile"],
+            "is_public": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    client_id = created.json()["client_id"]
+    verifier, challenge = _pkce_pair()
+    request = {
+        "client_id": client_id,
+        "redirect_uri": redirect,
+        "scope": "profile",
+        "code_challenge": challenge,
+    }
+    with patch("app.routers.auth.qrcode.make") as make_qr:
+        make_qr.return_value.to_string.return_value = "<svg />"
+        begin = desktop.post("/api/auth/qr-login/begin", json=request)
+    assert begin.status_code == 200, begin.text
+    scanned = {"token": parse_qs(urlsplit(make_qr.call_args.args[0]).query)["token"][0]}
+    poll = {key: begin.json()[key] for key in ("challenge_id", "poll_token")}
+    assert desktop.post("/api/auth/qr-login/poll", json=poll).json() == {"status": "pending"}
+    assert desktop.post("/api/auth/qr-login/approve", json=scanned).status_code == 401
+    assert root_client.post("/api/auth/qr-login/info", json=scanned).json() == {
+        "application": "校赛客户端",
+        "scopes": ["基本身份信息"],
+    }
+    assert root_client.post("/api/auth/qr-login/approve", json=scanned).status_code == 200
+
+    barrier = Barrier(2)
+
+    def redeem():
+        with TestClient(app, raise_server_exceptions=True) as requester:
+            barrier.wait(timeout=5)
+            return requester.post("/api/auth/qr-login/poll", json=poll)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: redeem(), range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 410]
+    approved = next(response for response in responses if response.status_code == 200)
+    assert approved.json()["status"] == "authorized"
+    assert "set-cookie" not in approved.headers
+    token = desktop.post(
+        "/api/oauth/token",
+        json={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "code": approved.json()["code"],
+            "code_verifier": verifier,
+            "redirect_uri": redirect,
+        },
+    )
+    assert token.status_code == 200, token.text
 
 
 def test_admin_oauth_client_crud_and_validation(root_client, member_client):
