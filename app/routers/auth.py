@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import secrets
 import threading
 import time
 from collections import deque
@@ -22,7 +23,17 @@ from sqlmodel import Session, select
 from ..config import get_settings
 from ..db import get_session
 from ..deps import get_current_session, get_current_user, get_optional_user, require_origin_secret
-from ..models import Invite, InviteUse, LoginTicket, Role, User, UserSession, UserStatus, utcnow
+from ..models import (
+    Invite,
+    InviteUse,
+    LoginTicket,
+    QRLoginChallenge,
+    Role,
+    User,
+    UserSession,
+    UserStatus,
+    utcnow,
+)
 from ..reviews import create_registration_review
 from ..schemas import (
     ChangePasswordRequest,
@@ -53,6 +64,113 @@ router = APIRouter(
     tags=["auth"],
     dependencies=[Depends(require_origin_secret)],
 )
+
+
+class QRLoginApproveRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=128)
+
+
+class QRLoginPollRequest(BaseModel):
+    challenge_id: str = Field(min_length=16, max_length=64)
+    poll_token: str = Field(min_length=32, max_length=128)
+
+
+@router.post("/qr-login/begin")
+def begin_qr_login(db: Session = Depends(get_session)) -> dict[str, object]:
+    now = utcnow()
+    db.exec(delete(QRLoginChallenge).where(QRLoginChallenge.expires_at <= now))
+    challenge_id = secrets.token_urlsafe(24)
+    approval_token = secrets.token_urlsafe(32)
+    poll_token = secrets.token_urlsafe(32)
+    expires_at = now + timedelta(minutes=2)
+    db.add(
+        QRLoginChallenge(
+            id=challenge_id,
+            approval_token_hash=hash_session_token(approval_token),
+            poll_token_hash=hash_session_token(poll_token),
+            expires_at=expires_at,
+        )
+    )
+    db.commit()
+
+    settings = get_settings()
+    approval_url = f"{settings.rp_origin.rstrip('/')}/qr-login?token={approval_token}"
+    image = qrcode.make(approval_url, image_factory=qrcode.image.svg.SvgPathImage)
+    return {
+        "challenge_id": challenge_id,
+        "poll_token": poll_token,
+        "qr_svg": image.to_string(encoding="unicode"),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@router.post("/qr-login/approve")
+def approve_qr_login(
+    payload: QRLoginApproveRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, str]:
+    now = utcnow()
+    row = db.exec(
+        select(QRLoginChallenge).where(
+            QRLoginChallenge.approval_token_hash == hash_session_token(payload.token),
+            QRLoginChallenge.status == "pending",
+            QRLoginChallenge.expires_at > now,
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=410, detail="二维码已过期或已使用")
+    result = db.exec(
+        update(QRLoginChallenge)
+        .where(
+            QRLoginChallenge.id == row.id,
+            QRLoginChallenge.status == "pending",
+            QRLoginChallenge.expires_at > now,
+        )
+        .values(status="approved", user_id=user.id)
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=410, detail="二维码已过期或已确认")
+    db.commit()
+    return {"status": "approved"}
+
+
+@router.post("/qr-login/poll")
+def poll_qr_login(
+    payload: QRLoginPollRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_session),
+) -> dict[str, str]:
+    now = utcnow()
+    row = db.exec(
+        select(QRLoginChallenge).where(
+            QRLoginChallenge.id == payload.challenge_id,
+            QRLoginChallenge.poll_token_hash == hash_session_token(payload.poll_token),
+        )
+    ).first()
+    if row is None or row.expires_at <= now or row.status in {"expired", "consumed"}:
+        raise HTTPException(status_code=410, detail="二维码已过期")
+    if row.status == "pending":
+        return {"status": "pending"}
+    if row.status != "approved" or row.user_id is None:
+        raise HTTPException(status_code=409, detail="二维码状态无效")
+
+    result = db.exec(
+        update(QRLoginChallenge)
+        .where(QRLoginChallenge.id == row.id, QRLoginChallenge.status == "approved")
+        .values(status="consumed")
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=410, detail="二维码已使用")
+    user = db.get(User, row.user_id)
+    if user is None or user.status != UserStatus.ACTIVE:
+        raise HTTPException(status_code=403, detail="该账号当前不可登录")
+    user.last_login_at = now
+    token = _issue_session(db, user, request)
+    _set_session_cookie(response, token)
+    db.commit()
+    return {"status": "authenticated"}
 
 #: Verified against when a login names an unknown student id, so the failure
 #: path costs the same as a real one. Computed once at import: hashing on every

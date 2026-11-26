@@ -330,6 +330,41 @@ def test_login_and_me(client, root_client):
     assert me.json()["student_id"] == MEMBER_STUDENT_ID
 
 
+def test_qr_login_requires_phone_confirmation_and_is_consumed_once(client, root_client):
+    from unittest.mock import patch
+
+    with patch("app.routers.auth.qrcode.make") as make_qr:
+        make_qr.return_value.to_string.return_value = "<svg />"
+        challenge = client.post("/api/auth/qr-login/begin")
+    assert challenge.status_code == 200, challenge.text
+    body = challenge.json()
+    approval_url = make_qr.call_args.args[0]
+    approval_token = approval_url.split("token=", 1)[1]
+
+    pending = client.post(
+        "/api/auth/qr-login/poll",
+        json={"challenge_id": body["challenge_id"], "poll_token": body["poll_token"]},
+    )
+    assert pending.json() == {"status": "pending"}
+
+    approved = root_client.post(
+        "/api/auth/qr-login/approve", json={"token": approval_token}
+    )
+    assert approved.status_code == 200, approved.text
+
+    logged_in = client.post(
+        "/api/auth/qr-login/poll",
+        json={"challenge_id": body["challenge_id"], "poll_token": body["poll_token"]},
+    )
+    assert logged_in.json() == {"status": "authenticated"}
+    assert client.get("/api/auth/me").json()["student_id"] == ROOT_STUDENT_ID
+    replay = client.post(
+        "/api/auth/qr-login/poll",
+        json={"challenge_id": body["challenge_id"], "poll_token": body["poll_token"]},
+    )
+    assert replay.status_code == 410
+
+
 def test_login_is_case_and_whitespace_insensitive_on_student_id(client):
     response = client.post(
         "/api/auth/login",

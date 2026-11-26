@@ -1179,6 +1179,20 @@ class WebAuthnChallenge(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class QRLoginChallenge(SQLModel, table=True):
+    """Short-lived phone approval for a browser login."""
+
+    __tablename__ = "qr_login_challenges"
+
+    id: str = Field(primary_key=True, max_length=64)
+    approval_token_hash: str = Field(max_length=64)
+    poll_token_hash: str = Field(max_length=64, unique=True)
+    status: str = Field(default="pending", max_length=16, index=True)
+    user_id: int | None = Field(default=None, foreign_key="users.id", index=True)
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class OAuthClient(SQLModel, table=True):
     """工作坊 OAuth 2.0 客户端注册表。
 
