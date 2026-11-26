@@ -223,6 +223,21 @@ def test_member_signature_is_editable_and_visible_without_renaming(client, root_
     assert client.patch("/api/auth/me", json={"signature": ""}).json()["signature"] == ""
 
 
+def test_only_admin_can_change_another_members_signature(client, root_client):
+    invite = _make_invite(root_client)
+    user = _register_and_login(client, root_client, invite["code"])
+    endpoint = f"/api/admin/users/{user['id']}"
+    assert client.patch(endpoint, json={"signature": "禁止"}).status_code == 403
+    edited = root_client.patch(endpoint, json={"signature": "  继续练习  "})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["signature"] == "继续练习"
+    assert client.get("/api/auth/me").json()["signature"] == "继续练习"
+    assert root_client.patch(endpoint, json={"signature": "签" * 13}).status_code == 422
+    assert client.get("/api/auth/me").json()["signature"] == "继续练习"
+    assert root_client.patch(endpoint, json={"signature": ""}).json()["signature"] == ""
+    assert root_client.get("/api/admin/reviews", params={"status": "pending"}).json()["items"] == []
+
+
 def test_register_rejects_bad_student_id(client, root_client):
     invite = _make_invite(root_client)
     response = _register(client, invite["code"], student_id="12345")
@@ -382,14 +397,17 @@ def test_disabled_account_cannot_log_in(client, root_client):
 # --------------------------------------------------------------------------- #
 
 
-def test_update_own_display_name(client):
+def test_admin_cannot_change_own_display_name_directly(client):
     client.post(
         "/api/auth/login",
         json={"student_id": ROOT_STUDENT_ID, "password": ROOT_PASSWORD},
     )
+    me = client.get("/api/auth/me").json()
     response = client.patch("/api/auth/me", json={"display_name": "新名字"})
-    assert response.status_code == 200
-    assert response.json()["display_name"] == "新名字"
+    assert response.status_code == 403
+    admin_response = client.patch(f"/api/admin/users/{me['id']}", json={"display_name": "新名字"})
+    assert admin_response.status_code == 403
+    assert client.get("/api/auth/me").json()["display_name"] == me["display_name"]
 
 
 def test_member_cannot_change_own_role(client, root_client):

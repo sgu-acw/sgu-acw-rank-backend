@@ -5,7 +5,7 @@
 2. 成员改名 / 更改个人学籍信息（学院、专业、班级）申请。
 
 另外集中处理 ``apply_display_name_change``：无论通过审核生效、管理员后台
-直接修改，还是管理员自助改名，旧姓名都会自动沉淀进 ``former_names_json``
+直接修改，旧姓名都会自动沉淀进 ``former_names_json``
 并递增 ``honor_revision``，确保永远可追溯成员改名前是谁。
 """
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 
 from fastapi import HTTPException
-from sqlalchemy import func, update
+from sqlalchemy import func, or_, update
 from sqlmodel import Session, select
 
 from . import academic, notifications
@@ -252,6 +252,7 @@ def _claim_pending_review(
         .where(
             ReviewRequest.id == review_id,
             ReviewRequest.status == ReviewStatus.PENDING,
+            or_(ReviewRequest.user_id.is_(None), ReviewRequest.user_id != admin_id),  # type: ignore[union-attr]
         )
         .values(
             status=next_status,
@@ -264,6 +265,8 @@ def _claim_pending_review(
         existing = db.get(ReviewRequest, review_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="审核单不存在")
+        if existing.user_id == admin_id:
+            raise HTTPException(status_code=403, detail="请由其他管理员处理你的申请")
         raise HTTPException(status_code=409, detail="该审核单已处理，无法重复操作")
     row = db.get(ReviewRequest, review_id, populate_existing=True)
     assert row is not None

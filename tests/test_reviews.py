@@ -482,13 +482,32 @@ def test_profile_change_reject_and_external_restrictions_and_admin_rename_archiv
         after_rev = db.get(User, ext_id).honor_revision
         assert after_rev == before_rev + 1
 
-    # 管理员自助 PATCH /auth/me 改名仍放行且自动记录曾用名
-    root_before_name = root_client.get("/api/auth/me").json()["display_name"]
-    self_rename = root_client.patch("/api/auth/me", json={"display_name": "站长新名字"})
-    assert self_rename.status_code == 200
-    root_row = next(
-        u
-        for u in root_client.get("/api/admin/users").json()["items"]
-        if u["student_id"] == ROOT_STUDENT_ID
+    root_before = root_client.get("/api/auth/me").json()
+    pending = root_client.post("/api/auth/me/change-requests", json={"display_name": "站长新名字"})
+    assert pending.status_code == 201, pending.text
+    assert root_client.get("/api/auth/me").json()["display_name"] == root_before["display_name"]
+    review_id = pending.json()["id"]
+    approval_path = f"/api/admin/reviews/{review_id}/approve"
+    assert root_client.post(approval_path, json={}).status_code == 403
+    assert root_client.post(f"/api/admin/reviews/{review_id}/reject", json={}).status_code == 403
+
+    created_admin = root_client.post(
+        "/api/admin/users",
+        json={
+            "student_id": MEMBER_STUDENT_ID,
+            "password": MEMBER_PASSWORD,
+            "display_name": "另一位管理员",
+            "role": "admin",
+        },
     )
-    assert root_before_name in root_row["former_names"]
+    assert created_admin.status_code == 201, created_admin.text
+    with TestClient(app) as approver:
+        login = approver.post(
+            "/api/auth/login", json={"student_id": MEMBER_STUDENT_ID, "password": MEMBER_PASSWORD}
+        )
+        assert login.status_code == 200, login.text
+        assert approver.post(approval_path, json={}).status_code == 200
+
+    assert root_client.get("/api/auth/me").json()["display_name"] == "站长新名字"
+    root_row = root_client.get(f"/api/admin/users/{root_before['id']}").json()
+    assert root_before["display_name"] in root_row["former_names"]

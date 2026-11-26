@@ -8,8 +8,9 @@ explicitly.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from .models import Platform, ProblemListKind, Role
 
@@ -118,6 +119,18 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+def _clean_signature(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    if cleaned and len(cleaned.splitlines()) > 1:
+        raise ValueError("个性签名只能填写一行")
+    return cleaned
+
+
+ProfileSignature = Annotated[str, Field(max_length=12), BeforeValidator(_clean_signature)]
+
+
 class UpdateSelfRequest(BaseModel):
     """Fields a member may change about themselves.
 
@@ -127,17 +140,7 @@ class UpdateSelfRequest(BaseModel):
 
     display_name: str | None = Field(default=None, min_length=1, max_length=32)
 
-    signature: str | None = Field(default=None, max_length=12)
-
-    @field_validator("signature", mode="before")
-    @classmethod
-    def _clean_signature(cls, value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        cleaned = value.strip()
-        if cleaned and len(cleaned.splitlines()) > 1:
-            raise ValueError("个性签名只能填写一行")
-        return cleaned
+    signature: ProfileSignature | None = None
 
     @field_validator("display_name")
     @classmethod
@@ -204,6 +207,7 @@ class UpdateUserAdminRequest(BaseModel):
     status: str | None = None
     admin_note: str | None = Field(default=None, max_length=2000)
     display_name: str | None = Field(default=None, min_length=1, max_length=32)
+    signature: ProfileSignature | None = None
     #: 学院名/专业名的人工覆盖。传空串表示恢复成按学号查表。
     #:
     #: 名字带 override 是为了跟响应里的 college_name 区分——后者是解析结果

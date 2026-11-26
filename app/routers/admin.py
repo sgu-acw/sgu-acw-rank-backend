@@ -372,6 +372,9 @@ def update_user(
     if user is None:
         raise HTTPException(status_code=404, detail="成员不存在")
 
+    if user.id == admin.id and payload.display_name not in (None, user.display_name):
+        raise HTTPException(status_code=403, detail="请在个人中心提交自己的改名申请")
+
     if payload.role is not None and payload.role != user.role:
         if user.is_root:
             raise HTTPException(status_code=403, detail="不能修改 root 的角色")
@@ -403,6 +406,8 @@ def update_user(
 
     if payload.display_name is not None:
         apply_display_name_change(user, payload.display_name)
+    if payload.signature is not None:
+        user.signature = payload.signature
 
     if payload.can_post is not None:
         if user.is_external and payload.can_post:

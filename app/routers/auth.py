@@ -23,7 +23,7 @@ from ..config import get_settings
 from ..db import get_session
 from ..deps import get_current_session, get_current_user, get_optional_user, require_origin_secret
 from ..models import Invite, InviteUse, LoginTicket, Role, User, UserSession, UserStatus, utcnow
-from ..reviews import apply_display_name_change, create_registration_review
+from ..reviews import create_registration_review
 from ..schemas import (
     ChangePasswordRequest,
     ExternalRegisterRequest,
@@ -663,12 +663,10 @@ def update_me(
     db: Session = Depends(get_session),
 ) -> User:
     if payload.display_name is not None and payload.display_name != user.display_name:
-        if not user.is_admin:
-            raise HTTPException(
-                status_code=403,
-                detail="修改姓名和个人资料需提交管理员审核，请通过资料修改申请提交",
-            )
-        apply_display_name_change(user, payload.display_name)
+        raise HTTPException(
+            status_code=403,
+            detail="修改姓名请提交资料修改申请，审核通过后生效",
+        )
     if payload.signature is not None:
         user.signature = payload.signature
     db.add(user)
