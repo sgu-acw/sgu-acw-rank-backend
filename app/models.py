@@ -26,6 +26,7 @@ def utcnow() -> datetime:
 
 #: 秒数常量。调度相关的判断都按天算，写个名字比一串 86400 清楚。
 DAY_SECONDS = 86400
+PROFILE_SIGNATURE_MAX_LENGTH = 16
 
 
 class Role:
@@ -113,7 +114,7 @@ class User(SQLModel, table=True):
     student_id: str = Field(index=True, unique=True, max_length=16)
     password_hash: str
     display_name: str = Field(max_length=64)
-    signature: str = Field(default="", max_length=12)
+    signature: str = Field(default="", max_length=PROFILE_SIGNATURE_MAX_LENGTH)
 
     # Admin-maintained name history and enrollment overrides for award review.
     former_names_json: str = "[]"

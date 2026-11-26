@@ -202,8 +202,8 @@ def test_registration_without_review_issues_session_for_new_accounts_only(
 def test_member_signature_is_editable_and_visible_without_renaming(client, root_client):
     invite = _make_invite(root_client)
     member = _register_and_login(client, root_client, invite["code"])
-    signature = "每天做一道题坚持到毕业呀"
-    assert len(signature) == 12
+    signature = "算法竞赛每天练习坚持到底永不放弃"
+    assert len(signature) == 16
     saved = client.patch("/api/auth/me", json={"signature": f"  {signature}  "})
     assert saved.status_code == 200, saved.text
     assert saved.json()["signature"] == signature
@@ -228,12 +228,13 @@ def test_only_admin_can_change_another_members_signature(client, root_client):
     user = _register_and_login(client, root_client, invite["code"])
     endpoint = f"/api/admin/users/{user['id']}"
     assert client.patch(endpoint, json={"signature": "禁止"}).status_code == 403
-    edited = root_client.patch(endpoint, json={"signature": "  继续练习  "})
+    signature = "签" * 16
+    edited = root_client.patch(endpoint, json={"signature": f"  {signature}  "})
     assert edited.status_code == 200, edited.text
-    assert edited.json()["signature"] == "继续练习"
-    assert client.get("/api/auth/me").json()["signature"] == "继续练习"
-    assert root_client.patch(endpoint, json={"signature": "签" * 13}).status_code == 422
-    assert client.get("/api/auth/me").json()["signature"] == "继续练习"
+    assert edited.json()["signature"] == signature
+    assert client.get("/api/auth/me").json()["signature"] == signature
+    assert root_client.patch(endpoint, json={"signature": signature + "签"}).status_code == 422
+    assert client.get("/api/auth/me").json()["signature"] == signature
     assert root_client.patch(endpoint, json={"signature": ""}).json()["signature"] == ""
     assert root_client.get("/api/admin/reviews", params={"status": "pending"}).json()["items"] == []
 

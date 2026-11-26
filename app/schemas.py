@@ -12,7 +12,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
-from .models import Platform, ProblemListKind, Role
+from .models import PROFILE_SIGNATURE_MAX_LENGTH, Platform, ProblemListKind, Role
 
 
 class UserPublic(BaseModel):
@@ -128,7 +128,9 @@ def _clean_signature(value: object) -> object:
     return cleaned
 
 
-ProfileSignature = Annotated[str, Field(max_length=12), BeforeValidator(_clean_signature)]
+ProfileSignature = Annotated[
+    str, Field(max_length=PROFILE_SIGNATURE_MAX_LENGTH), BeforeValidator(_clean_signature)
+]
 
 
 class UpdateSelfRequest(BaseModel):
