@@ -22,6 +22,7 @@ class UserPublic(BaseModel):
     id: int
     student_id: str
     display_name: str
+    signature: str = ""
     enroll_year: int
     level: int
     college_code: str
@@ -126,6 +127,18 @@ class UpdateSelfRequest(BaseModel):
 
     display_name: str | None = Field(default=None, min_length=1, max_length=32)
 
+    signature: str | None = Field(default=None, max_length=12)
+
+    @field_validator("signature", mode="before")
+    @classmethod
+    def _clean_signature(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        if cleaned and len(cleaned.splitlines()) > 1:
+            raise ValueError("个性签名只能填写一行")
+        return cleaned
+
     @field_validator("display_name")
     @classmethod
     def _strip_name(cls, value: str | None) -> str | None:
@@ -171,6 +184,7 @@ class InvitePublic(BaseModel):
     #: 邀请码是要追责的——码被转发出去、或者发错了人，得知道找谁问。
     #: 只给一个数字 id 等于没给。姓名可能重名，所以带上学号。
     created_by_name: str | None = None
+    created_by_signature: str = ""
     created_by_student_id: str | None = None
     created_at: datetime
     is_usable: bool
@@ -302,6 +316,7 @@ class RankEntry(BaseModel):
 
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     platform: str
@@ -344,6 +359,7 @@ class DailyPracticeEntry(BaseModel):
 
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     rank: int = 0
@@ -392,6 +408,7 @@ class RatingEntry(BaseModel):
 
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     rank: int = 0
@@ -685,6 +702,7 @@ class AdminMemberDetail(BaseModel):
 
     id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     level: int
@@ -720,6 +738,7 @@ class ProblemListRankEntry(BaseModel):
 
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     college_name: str | None = None
@@ -788,6 +807,7 @@ class ReviewRequestPublic(BaseModel):
     user_id: int | None = None
     student_id: str
     current_display_name: str
+    signature: str = ""
     role: str
     invite_code: str | None = None
     before: dict[str, object] = Field(default_factory=dict)
@@ -796,6 +816,7 @@ class ReviewRequestPublic(BaseModel):
     review_note: str = ""
     reviewed_by: int | None = None
     reviewer_name: str | None = None
+    reviewer_signature: str = ""
     reviewer_student_id: str | None = None
     created_at: datetime
     reviewed_at: datetime | None = None

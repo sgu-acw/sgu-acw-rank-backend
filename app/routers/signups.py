@@ -236,6 +236,7 @@ class EntryOut(BaseModel):
     id: int
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     class_label: str | None
     answers: dict
@@ -612,7 +613,8 @@ def admin_entries(
         EntryOut(
             id=e.id or 0,
             user_id=e.user_id,
-            display_name=users.get(e.user_id).display_name if users.get(e.user_id) else "",
+            display_name=users[e.user_id].display_name if e.user_id in users else "",
+            signature=users[e.user_id].signature if e.user_id in users else "",
             student_id=users.get(e.user_id).student_id if users.get(e.user_id) else "",
             class_label=users.get(e.user_id).class_label if users.get(e.user_id) else None,
             answers=json.loads(e.answers_json or "{}"),

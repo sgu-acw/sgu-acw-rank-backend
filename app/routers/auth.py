@@ -669,6 +669,8 @@ def update_me(
                 detail="修改姓名和个人资料需提交管理员审核，请通过资料修改申请提交",
             )
         apply_display_name_change(user, payload.display_name)
+    if payload.signature is not None:
+        user.signature = payload.signature
     db.add(user)
     db.commit()
     db.refresh(user)

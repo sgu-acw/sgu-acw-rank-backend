@@ -113,6 +113,7 @@ class User(SQLModel, table=True):
     student_id: str = Field(index=True, unique=True, max_length=16)
     password_hash: str
     display_name: str = Field(max_length=64)
+    signature: str = Field(default="", max_length=12)
 
     # Admin-maintained name history and enrollment overrides for award review.
     former_names_json: str = "[]"

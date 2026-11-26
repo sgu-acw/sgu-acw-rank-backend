@@ -120,6 +120,8 @@ def award_views(db, *, admin=False, user_id=None):
                 )
             ):
                 member = {"name": p.display_name if p else r.raw_name}
+                if p and p.signature:
+                    member["signature"] = p.signature
                 if admin:
                     candidates, suggested = match_candidates(r.raw_name, e, users, index)
                     member.update(

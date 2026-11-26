@@ -283,6 +283,7 @@ class AuthorizeInfoOut(BaseModel):
     eligible: bool
     ineligible_reason: str | None = None
     user_display_name: str | None = None
+    user_signature: str = ""
     user_student_id: str | None = None
     user_role: str | None = None
 
@@ -338,6 +339,7 @@ def authorize_info(
         eligible=eligible,
         ineligible_reason=reason,
         user_display_name=user.display_name if user else None,
+        user_signature=user.signature if user else "",
         user_student_id=user.student_id if user else None,
         user_role=user.role if user else None,
     )

@@ -278,7 +278,18 @@ def leaderboard(session: Session, camp: Camp) -> list[tuple[User, int, dict[str,
 def standings(session: Session, camp: Camp) -> list[dict]:
     result = session.get(CampFinalization, camp.id)
     if result and result.finalized_at:
-        return json.loads(result.standings_json)
+        rows = json.loads(result.standings_json)
+        signatures = {
+            (uid, student_id): signature
+            for uid, student_id, signature in session.exec(
+                select(User.id, User.student_id, User.signature).where(
+                    User.id.in_({row["user_id"] for row in rows})  # type: ignore[attr-defined]
+                )
+            )
+        }
+        for row in rows:
+            row["signature"] = signatures.get((row["user_id"], row["student_id"]), "")
+        return rows
     # 标准竞赛名次：同分同名次，后面的位次跳过（1、2、2、4）。
     # 行内排序仍然稳定——同分按学号，名次一样时谁先谁后不影响阅读。
     out = []
@@ -293,6 +304,7 @@ def standings(session: Session, camp: Camp) -> list[dict]:
                 "rank": rank,
                 "user_id": u.id,
                 "display_name": u.display_name,
+                "signature": u.signature,
                 "student_id": u.student_id,
                 "enroll_year": u.enroll_year,
                 "class_label": u.class_label,

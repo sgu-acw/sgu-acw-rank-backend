@@ -60,6 +60,7 @@ class CampLeaderboardEntry(BaseModel):
     rank: int
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     class_label: str | None = None
@@ -526,7 +527,8 @@ def admin_detail(
         registrations=[
             {
                 "user_id": r.user_id,
-                "display_name": users.get(r.user_id).display_name if users.get(r.user_id) else "",
+                "display_name": users[r.user_id].display_name if r.user_id in users else "",
+                "signature": users[r.user_id].signature if r.user_id in users else "",
                 "registered_at": r.registered_at.isoformat(),
             }
             for r in registrations

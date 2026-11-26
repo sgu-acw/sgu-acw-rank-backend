@@ -183,6 +183,7 @@ def build_practice_rank(
             DailyPracticeEntry(
                 user_id=user_id,
                 display_name=user.display_name,
+                signature=user.signature,
                 student_id=user.student_id,
                 enroll_year=user.enroll_year,
                 college_code=user.college_code,
@@ -455,6 +456,7 @@ def rating_board(
             RatingEntry(
                 user_id=user.id,
                 display_name=user.display_name,
+                signature=user.signature,
                 student_id=user.student_id,
                 enroll_year=user.enroll_year,
                 college_code=user.college_code,

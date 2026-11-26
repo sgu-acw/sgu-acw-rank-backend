@@ -199,6 +199,30 @@ def test_registration_without_review_issues_session_for_new_accounts_only(
     )
 
 
+def test_member_signature_is_editable_and_visible_without_renaming(client, root_client):
+    invite = _make_invite(root_client)
+    member = _register_and_login(client, root_client, invite["code"])
+    signature = "每天做一道题坚持到毕业呀"
+    assert len(signature) == 12
+    saved = client.patch("/api/auth/me", json={"signature": f"  {signature}  "})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["signature"] == signature
+    assert saved.json()["display_name"] == member["display_name"]
+    assert client.get("/api/auth/session").json()["user"]["signature"] == signature
+    members = root_client.get("/api/users").json()
+    visible = next(row for row in members if row["student_id"] == MEMBER_STUDENT_ID)
+    assert visible["signature"] == signature
+
+    for invalid in (signature + "哦", "一行\n两行"):
+        assert client.patch("/api/auth/me", json={"signature": invalid}).status_code == 422
+    denied = client.patch(
+        "/api/auth/me", json={"signature": "不能一并改名", "display_name": "新名字"}
+    )
+    assert denied.status_code == 403
+    assert client.get("/api/auth/me").json()["signature"] == signature
+    assert client.patch("/api/auth/me", json={"signature": ""}).json()["signature"] == ""
+
+
 def test_register_rejects_bad_student_id(client, root_client):
     invite = _make_invite(root_client)
     response = _register(client, invite["code"], student_id="12345")

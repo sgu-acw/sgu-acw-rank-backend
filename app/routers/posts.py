@@ -38,6 +38,7 @@ class PostSummary(BaseModel):
     is_popup: bool
     published_at: str  # created_at 的 ISO，列表显示用
     author_name: str
+    author_signature: str = ""
 
 
 class PostDetail(PostSummary):
@@ -96,6 +97,7 @@ def _to_summary(post: Post, author: User | None) -> PostSummary:
         is_popup=post.is_popup,
         published_at=post.created_at.isoformat(),
         author_name=author.display_name if author else "",
+        author_signature=author.signature if author else "",
     )
 
 

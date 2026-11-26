@@ -92,6 +92,7 @@ def list_invites(
         creator = creators.get(row.created_by) if row.created_by else None
         if creator is not None:
             item.created_by_name = creator.display_name
+            item.created_by_signature = creator.signature
             item.created_by_student_id = creator.student_id
         out.append(item)
     return out
@@ -137,6 +138,7 @@ def create_invite(
     # 那一行跟其他行长得不一样，得刷新才有。
     item = InvitePublic.model_validate(invite)
     item.created_by_name = admin.display_name
+    item.created_by_signature = admin.signature
     item.created_by_student_id = admin.student_id
     return item
 
@@ -650,6 +652,7 @@ def get_member_detail(
     return AdminMemberDetail(
         id=user.id or 0,
         display_name=user.display_name,
+        signature=user.signature,
         student_id=user.student_id,
         enroll_year=user.enroll_year,
         level=user.level,

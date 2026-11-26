@@ -449,6 +449,7 @@ def cancel_pending_reviews_for_user(
 def serialize_review(
     row: ReviewRequest,
     reviewers: dict[int, User],
+    applicant: User | None = None,
 ) -> ReviewRequestPublic:
     reviewer = reviewers.get(row.reviewed_by) if row.reviewed_by is not None else None
     return ReviewRequestPublic(
@@ -458,6 +459,7 @@ def serialize_review(
         user_id=row.user_id,
         student_id=row.student_id,
         current_display_name=row.current_display_name,
+        signature=applicant.signature if applicant else "",
         role=row.role,
         invite_code=row.invite_code,
         before=_load_json_dict(row.before_json),
@@ -466,6 +468,7 @@ def serialize_review(
         review_note=row.review_note,
         reviewed_by=row.reviewed_by,
         reviewer_name=reviewer.display_name if reviewer else None,
+        reviewer_signature=reviewer.signature if reviewer else "",
         reviewer_student_id=reviewer.student_id if reviewer else None,
         created_at=row.created_at,
         reviewed_at=row.reviewed_at,

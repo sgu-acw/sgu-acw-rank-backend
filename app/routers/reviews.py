@@ -88,7 +88,7 @@ def list_my_change_requests(
         ).all()
     )
     reviewers = _load_reviewers(db, rows)
-    return [serialize_review(r, reviewers) for r in rows]
+    return [serialize_review(r, reviewers, user) for r in rows]
 
 
 @router.post(
@@ -105,7 +105,7 @@ def submit_my_change_request(
     row = create_profile_change_review(db, user, payload)
     db.commit()
     db.refresh(row)
-    return serialize_review(row, {})
+    return serialize_review(row, {}, user)
 
 
 @router.delete(
@@ -119,11 +119,7 @@ def cancel_my_change_request(
 ) -> Response:
     """撤回自己尚未审核的资料修改申请。"""
     row = db.get(ReviewRequest, request_id)
-    if (
-        row is None
-        or row.user_id != user.id
-        or row.kind != ReviewKind.PROFILE_CHANGE
-    ):
+    if row is None or row.user_id != user.id or row.kind != ReviewKind.PROFILE_CHANGE:
         raise HTTPException(status_code=404, detail="申请不存在")
     if row.status != ReviewStatus.PENDING:
         raise HTTPException(status_code=409, detail="该申请已处理，无法撤回")
@@ -202,8 +198,19 @@ def list_admin_reviews(
     rows = list(db.exec(statement.offset((page - 1) * page_size).limit(page_size)).all())
     reviewers = _load_reviewers(db, rows)
 
+    applicant_ids = {row.user_id for row in rows if row.user_id is not None}
+    applicants = (
+        {
+            user.id: user
+            for user in db.exec(
+                select(User).where(User.id.in_(applicant_ids))  # type: ignore[attr-defined]
+            )
+        }
+        if applicant_ids
+        else {}
+    )
     return AdminReviewPage(
-        items=[serialize_review(r, reviewers) for r in rows],
+        items=[serialize_review(r, reviewers, applicants.get(r.user_id)) for r in rows],
         total=total,
         pending_count=pending_reg + pending_prof,
         pending_registration_count=pending_reg,
@@ -226,7 +233,7 @@ def approve_review(
     db.commit()
     db.refresh(row)
     reviewers = {admin.id: admin} if admin.id is not None else {}
-    return serialize_review(row, reviewers)
+    return serialize_review(row, reviewers, db.get(User, row.user_id) if row.user_id else None)
 
 
 @router.post("/admin/reviews/{request_id}/reject", response_model=ReviewRequestPublic)
@@ -242,4 +249,4 @@ def reject_review(
     db.commit()
     db.refresh(row)
     reviewers = {admin.id: admin} if admin.id is not None else {}
-    return serialize_review(row, reviewers)
+    return serialize_review(row, reviewers, db.get(User, row.user_id) if row.user_id else None)

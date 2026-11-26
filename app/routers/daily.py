@@ -42,6 +42,12 @@ class DailyProblemEntry(BaseModel):
     solved: bool = False
 
 
+class CheckinMember(BaseModel):
+    user_id: int
+    display_name: str
+    signature: str = ""
+
+
 class DailyProblemBoard(BaseModel):
     """某一天的每日一题。"""
 
@@ -57,6 +63,7 @@ class DailyProblemBoard(BaseModel):
     checked_in_today: bool = False
     #: 今天有谁签到了。
     checked_in_today_names: list[str] = Field(default_factory=list)
+    checked_in_today_members: list[CheckinMember] = Field(default_factory=list)
 
 
 def _cached_map(session: Session, rows: list[DailyProblem]) -> dict[str, ProblemCache]:
@@ -132,33 +139,35 @@ def _checkin_stats(session: Session, user: User | None, day: str) -> dict:
     }
 
 
-def _checked_in_names(session: Session, day: str) -> list[str]:
-    """今天签到的人。公开信息，按首次过题顺序去重返回。"""
+def _checked_in_members(session: Session, day: str) -> list[CheckinMember]:
+    """按首次过题顺序返回签到成员，每人只出现一次。"""
     rows = session.exec(
-        select(User.id, User.display_name)
+        select(User.id, User.display_name, User.signature)
         .join(DailyProblemSolve, DailyProblemSolve.user_id == User.id)  # type: ignore[arg-type]
         .where(DailyProblemSolve.day == day)
         .order_by(DailyProblemSolve.created_at)  # type: ignore[arg-type]
     ).all()
     seen: set[int] = set()
-    names: list[str] = []
-    for uid, name in rows:
+    members: list[CheckinMember] = []
+    for uid, name, signature in rows:
         if uid in seen or not name:
             continue
         seen.add(uid)
-        names.append(name)
-    return names
+        members.append(CheckinMember(user_id=uid, display_name=name, signature=signature))
+    return members
 
 
 def _board(session: Session, day: str, user: User | None) -> DailyProblemBoard:
     rows = daily.ensure_daily(session, day=day)
     is_campus = user is not None and user.is_campus_member
     solved = solved_keys(session, user.id) if is_campus and user.id else None
+    members = _checked_in_members(session, day) if is_campus else []
     return DailyProblemBoard(
         day=day,
         reset_at=daily.next_reset_at(),
         problems=_to_entries(session, rows, solved=solved, include_campus_stats=is_campus),
-        checked_in_today_names=_checked_in_names(session, day) if is_campus else [],
+        checked_in_today_names=[member.display_name for member in members],
+        checked_in_today_members=members,
         **_checkin_stats(session, user if is_campus else None, day),
     )
 
@@ -222,6 +231,7 @@ class CheckinEntry(BaseModel):
     rank: int
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     class_label: str | None = None
@@ -244,6 +254,7 @@ class SolverEntry(BaseModel):
     rank: int
     user_id: int
     display_name: str
+    signature: str = ""
     student_id: str
     enroll_year: int
     class_label: str | None = None
@@ -321,6 +332,7 @@ def get_daily_solvers(
                     rank=len(entries) + 1,
                     user_id=row.user_id,
                     display_name=user.display_name,
+                    signature=user.signature,
                     student_id=user.student_id,
                     enroll_year=user.enroll_year,
                     class_label=user.class_label,
@@ -375,6 +387,7 @@ def get_checkin_board(
                 rank=len(entries) + 1,
                 user_id=standing.user_id,
                 display_name=user.display_name,
+                signature=user.signature,
                 student_id=user.student_id,
                 enroll_year=user.enroll_year,
                 class_label=user.class_label,

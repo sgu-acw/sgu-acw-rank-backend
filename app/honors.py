@@ -71,6 +71,7 @@ def user_view(user: User) -> dict:
     return {
         "id": user.id,
         "display_name": user.display_name,
+        "signature": user.signature,
         "student_id": user.student_id,
         "enroll_year": user.enroll_year,
         "former_names": former_names(user),

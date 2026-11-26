@@ -454,6 +454,7 @@ def completion_rank(db: Session, problem_list: ProblemList) -> list[ProblemListR
             ProblemListRankEntry(
                 user_id=member.id or 0,
                 display_name=member.display_name,
+                signature=member.signature,
                 student_id=member.student_id,
                 enroll_year=member.enroll_year,
                 college_name=member.college_name,
