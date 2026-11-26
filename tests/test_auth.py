@@ -159,6 +159,46 @@ def test_register_does_not_issue_session_before_review(client, root_client):
     assert "samesite=lax" in set_cookie.lower()
 
 
+def test_registration_without_review_issues_session_for_new_accounts_only(
+    client, root_client, monkeypatch
+):
+    from app.config import get_settings
+
+    pending_id = "25125023002"
+    invite = _make_invite(root_client, max_uses=2)
+    assert _register(client, invite["code"], student_id=pending_id).json()["status"] == "pending"
+
+    monkeypatch.setenv("SGU_ACW_REGISTRATION_REVIEW_REQUIRED", "false")
+    get_settings.cache_clear()
+    assert _register(client, "NOPE1234").status_code == 400
+    campus = _register(client, invite["code"])
+    assert campus.status_code == 201, campus.text
+    assert campus.json()["status"] == "active"
+    assert "HttpOnly" in campus.headers["set-cookie"]
+    assert client.get("/api/auth/me").json()["student_id"] == MEMBER_STUDENT_ID
+
+    external = client.post(
+        "/api/auth/register-external",
+        json={"username": "visitorsgu", "display_name": "校外成员", "password": MEMBER_PASSWORD},
+    )
+    assert external.status_code == 201, external.text
+    assert external.json()["status"] == "active"
+    assert external.json()["role"] == "external"
+    assert client.get("/api/auth/me").json()["student_id"] == "visitorsgu"
+
+    reviews = root_client.get(
+        "/api/admin/reviews", params={"status": "pending", "kind": "registration"}
+    ).json()
+    assert [row["student_id"] for row in reviews["items"]] == [pending_id]
+    assert _register(client, invite["code"], student_id="25125023003").status_code == 400
+    assert (
+        client.post(
+            "/api/auth/login", json={"student_id": pending_id, "password": MEMBER_PASSWORD}
+        ).status_code
+        == 403
+    )
+
+
 def test_register_rejects_bad_student_id(client, root_client):
     invite = _make_invite(root_client)
     response = _register(client, invite["code"], student_id="12345")
@@ -540,7 +580,10 @@ def test_disabled_members_are_hidden_from_the_directory(client, root_client):
     assert MEMBER_STUDENT_ID not in {e["student_id"] for e in visible}
 
 
-def test_concurrent_registration_cannot_overuse_invite(client, root_client):
+@pytest.mark.parametrize("review_required", ["true", "false"])
+def test_concurrent_registration_cannot_overuse_invite(
+    client, root_client, monkeypatch, review_required
+):
     """Many students racing for one slot must not all get in.
 
     The invite is claimed with a conditional UPDATE so SQLite's single-writer
@@ -550,6 +593,10 @@ def test_concurrent_registration_cannot_overuse_invite(client, root_client):
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
+    from app.config import get_settings
+
+    monkeypatch.setenv("SGU_ACW_REGISTRATION_REVIEW_REQUIRED", review_required)
+    get_settings.cache_clear()
     invite = _make_invite(root_client, max_uses=1)
     results: list[int | str] = []
     lock = threading.Lock()

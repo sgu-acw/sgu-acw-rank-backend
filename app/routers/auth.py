@@ -281,6 +281,8 @@ def register(
     except StudentIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    review_required = get_settings().registration_review_required
+    token = None
     try:
         invite = _claim_invite(db, payload.invite_code.strip().upper())
 
@@ -299,7 +301,7 @@ def register(
             major_code=parsed.major_code,
             class_no=parsed.class_no,
             role=invite.grants_role,
-            status=UserStatus.PENDING,
+            status=UserStatus.PENDING if review_required else UserStatus.ACTIVE,
             created_at=utcnow(),
         )
         db.add(user)
@@ -309,8 +311,10 @@ def register(
         # 转发到群外）光看次数查不出人来。
         db.add(InviteUse(invite_id=invite.id, user_id=user.id, used_at=utcnow()))
 
-        # 注册进入管理员审核队列；未通过前不签发登录会话。
-        create_registration_review(db, user, invite_code=invite.code)
+        if review_required:
+            create_registration_review(db, user, invite_code=invite.code)
+        else:
+            token = _issue_session(db, user, request)
         db.commit()
     except HTTPException:
         db.rollback()
@@ -320,6 +324,8 @@ def register(
         raise
 
     db.refresh(user)
+    if token is not None:
+        _set_session_cookie(response, token)
     return user
 
 
@@ -333,7 +339,7 @@ def register_external(
     """校外人员自助注册通道。
 
     无需邀请码与校内学号，使用自定义用户名（字母开头，3–16 位）创建
-    ``external`` 账号，提交后进入管理员审核队列，通过后即可登录。
+    ``external`` 账号。启用注册审核时，审批通过后即可登录。
     该角色只开放题库练习、每日一题、题单浏览、博客与荣誉殿堂等必要公开
     功能，无法查看校内成员名录、榜单、集训与报名信息。
     """
@@ -349,6 +355,8 @@ def register_external(
     if existing is not None:
         raise HTTPException(status_code=409, detail="该用户名已被注册")
 
+    review_required = get_settings().registration_review_required
+    token = None
     user = User(
         student_id=username,
         password_hash=hash_password(payload.password),
@@ -359,13 +367,16 @@ def register_external(
         major_code="",
         class_no=0,
         role=Role.EXTERNAL,
-        status=UserStatus.PENDING,
+        status=UserStatus.PENDING if review_required else UserStatus.ACTIVE,
         created_at=utcnow(),
     )
     try:
         db.add(user)
         db.flush()
-        create_registration_review(db, user)
+        if review_required:
+            create_registration_review(db, user)
+        else:
+            token = _issue_session(db, user, request)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -376,6 +387,8 @@ def register_external(
 
     _record_external_register(ip)
     db.refresh(user)
+    if token is not None:
+        _set_session_cookie(response, token)
     return user
 
 

@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     scrypt_r: int = 8
     scrypt_p: int = 1
 
+    # Gate new registrations only. Existing pending accounts still require review.
+    registration_review_required: bool = True
+
     # Invite defaults offered in the admin UI.
     invite_default_max_uses: int = 1
     invite_default_ttl_hours: int = 24
